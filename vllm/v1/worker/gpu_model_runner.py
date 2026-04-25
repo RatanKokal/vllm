@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -539,9 +540,24 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
+        self.prepare_inputs_events: list[torch.Event] | None = None
+        self._prepare_inputs_slot_initialized: list[bool] | None = None
+        self._prepare_inputs_active_slot = 0
+        configured_slots = int(os.getenv("VLLM_V1_INPUT_PREP_RING_SLOTS", "1"))
+        self.input_prep_num_slots = max(1, configured_slots)
+        if not self.use_async_scheduling:
+            self.input_prep_num_slots = 1
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
-            self.prepare_inputs_event = torch.Event()
+            if self.input_prep_num_slots > 1:
+                self.prepare_inputs_events = [
+                    torch.Event() for _ in range(self.input_prep_num_slots)
+                ]
+                self._prepare_inputs_slot_initialized = [
+                    False for _ in range(self.input_prep_num_slots)
+                ]
+            else:
+                self.prepare_inputs_event = torch.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -786,7 +802,14 @@ class GPUModelRunner(
             device=self.device,
             pin_memory=self.pin_memory,
             with_numpy=numpy,
+            num_slots=self.input_prep_num_slots,
         )
+
+    def _set_input_prep_slot(self, slot_idx: int) -> None:
+        for value in self.__dict__.values():
+            if isinstance(value, CpuGpuBuffer) and value.num_slots > 1:
+                value.set_slot(slot_idx)
+        self._prepare_inputs_active_slot = slot_idx
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -2979,6 +3002,21 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
+        if self.prepare_inputs_events is not None:
+            num_slots = len(self.prepare_inputs_events)
+            next_slot = (self._prepare_inputs_active_slot + 1) % num_slots
+            initialized = self._prepare_inputs_slot_initialized
+            assert initialized is not None
+            if initialized[next_slot]:
+                _event_synchronize_if_needed(self.prepare_inputs_events[next_slot])
+            self._set_input_prep_slot(next_slot)
+            try:
+                yield
+            finally:
+                self.prepare_inputs_events[next_slot].record()
+                initialized[next_slot] = True
+            return
+
         if self.prepare_inputs_event is None:
             yield
             return

@@ -113,20 +113,60 @@ class CpuGpuBuffer:
         device: torch.device,
         pin_memory: bool,
         with_numpy: bool = True,
+        num_slots: int = 1,
     ) -> None:
-        self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
-        self.gpu = torch.zeros_like(self.cpu, device=device)
-        self.np: np.ndarray
+        if num_slots < 1:
+            raise ValueError(f"num_slots must be >= 1, got {num_slots}")
+
+        self._slot_idx = 0
+        self._num_slots = num_slots
+        self._with_numpy = with_numpy
+
+        self._cpu_slots = [
+            torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
+            for _ in range(num_slots)
+        ]
+        self._gpu_slots = [
+            torch.zeros_like(cpu_slot, device=device) for cpu_slot in self._cpu_slots
+        ]
+
         # To keep type hints simple (avoiding generics and subclasses), we
-        # only conditionally create the numpy array attribute. This can cause
-        # AttributeError if `self.np` is accessed when `with_numpy=False`.
+        # only conditionally create numpy views. This can cause AttributeError
+        # if `self.np` is accessed when `with_numpy=False`.
         if with_numpy:
             if dtype == torch.bfloat16:
                 raise ValueError(
                     "Bfloat16 torch tensors cannot be directly cast to a "
                     "numpy array, so call CpuGpuBuffer with with_numpy=False"
                 )
-            self.np = self.cpu.numpy()
+            self._np_slots = [cpu_slot.numpy() for cpu_slot in self._cpu_slots]
+
+    @property
+    def num_slots(self) -> int:
+        return self._num_slots
+
+    def set_slot(self, slot_idx: int) -> None:
+        if slot_idx < 0 or slot_idx >= self._num_slots:
+            raise ValueError(
+                f"slot_idx must be in [0, {self._num_slots}), got {slot_idx}"
+            )
+        self._slot_idx = slot_idx
+
+    @property
+    def cpu(self) -> torch.Tensor:
+        return self._cpu_slots[self._slot_idx]
+
+    @property
+    def gpu(self) -> torch.Tensor:
+        return self._gpu_slots[self._slot_idx]
+
+    @property
+    def np(self) -> np.ndarray:
+        if not self._with_numpy:
+            raise AttributeError(
+                "CpuGpuBuffer does not expose np when with_numpy=False"
+            )
+        return self._np_slots[self._slot_idx]
 
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         if n is None:

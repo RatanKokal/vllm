@@ -108,10 +108,18 @@ class Qwen2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+        
+        raw_val = os.getenv("VLLM_USE_ARCH75_FUSED_QWEN2_MLP", "1")
+        try:
+            self._enable_arch75_fused_mlp = bool(int(raw_val))
+        except (ValueError, TypeError):
+            # Fallback to enabled (1) if the input is malformed
+            self._enable_arch75_fused_mlp = True
+        
         self.act_fn = SiluAndMul()
 
     def _can_use_arch75_fused_mlp(self, x: torch.Tensor) -> bool:
-        if not bool(int(os.getenv("VLLM_USE_ARCH75_FUSED_QWEN2_MLP", "1"))):
+        if not self._enable_arch75_fused_mlp:
             return False
 
         if not isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod):

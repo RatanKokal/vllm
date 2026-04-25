@@ -543,7 +543,13 @@ class GPUModelRunner(
         self.prepare_inputs_events: list[torch.Event] | None = None
         self._prepare_inputs_slot_initialized: list[bool] | None = None
         self._prepare_inputs_active_slot = 0
-        configured_slots = int(os.getenv("VLLM_V1_INPUT_PREP_RING_SLOTS", "1"))
+        # Defensive parsing for ring slots to prevent startup crash
+        raw_slots = os.getenv("VLLM_V1_INPUT_PREP_RING_SLOTS", "1")
+        try:
+            configured_slots = int(raw_slots)
+        except (ValueError, TypeError):
+            configured_slots = 1
+        
         self.input_prep_num_slots = max(1, configured_slots)
         if not self.use_async_scheduling:
             self.input_prep_num_slots = 1
@@ -806,9 +812,18 @@ class GPUModelRunner(
         )
 
     def _set_input_prep_slot(self, slot_idx: int) -> None:
+        """Sets the active slot for all managed multi-slot buffers."""
         for value in self.__dict__.values():
+            # Handle direct buffer attributes
             if isinstance(value, CpuGpuBuffer) and value.num_slots > 1:
                 value.set_slot(slot_idx)
+            
+            # FIX: Handle buffers nested in lists (e.g., multi-modal embed buffers)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, CpuGpuBuffer) and item.num_slots > 1:
+                        item.set_slot(slot_idx)
+                        
         self._prepare_inputs_active_slot = slot_idx
 
     def _init_model_kwargs(self):

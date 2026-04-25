@@ -25,6 +25,7 @@
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
@@ -46,6 +47,11 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.triton_fused_mlp import (
+    can_use_fused_gate_up_silu_mul,
+    fused_gate_up_silu_mul,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -102,11 +108,43 @@ class Qwen2MLP(nn.Module):
             raise ValueError(
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
+        
+        raw_val = os.getenv("VLLM_USE_ARCH75_FUSED_QWEN2_MLP", "1")
+        try:
+            self._enable_arch75_fused_mlp = bool(int(raw_val))
+        except (ValueError, TypeError):
+            # Fallback to enabled (1) if the input is malformed
+            self._enable_arch75_fused_mlp = True
+        
         self.act_fn = SiluAndMul()
 
+    def _can_use_arch75_fused_mlp(self, x: torch.Tensor) -> bool:
+        if not self._enable_arch75_fused_mlp:
+            return False
+
+        if not isinstance(self.gate_up_proj.quant_method, UnquantizedLinearMethod):
+            return False
+
+        gate_up_weight = getattr(self.gate_up_proj, "weight", None)
+        if gate_up_weight is None:
+            return False
+
+        return can_use_fused_gate_up_silu_mul(
+            x,
+            gate_up_weight,
+            bias=self.gate_up_proj.bias,
+        )
+
     def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
+        if self._can_use_arch75_fused_mlp(x):
+            x = fused_gate_up_silu_mul(
+                x,
+                self.gate_up_proj.weight,
+                bias=self.gate_up_proj.bias,
+            )
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 

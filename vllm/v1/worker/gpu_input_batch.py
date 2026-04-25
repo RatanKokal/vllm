@@ -26,6 +26,11 @@ from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 
+def _event_synchronize_if_needed(event: torch.Event) -> None:
+    if not event.query():
+        event.synchronize()
+
+
 @dataclass
 class CachedRequestState:
     req_id: str
@@ -945,7 +950,8 @@ class InputBatch:
             return
 
         assert self.prev_req_id_to_index is not None
-        sampled_token_ids = None
+        sampled_token_ids_by_prev_index: dict[int, list[int]] = {}
+        copy_waited = False
         for index, req_id in enumerate(self.req_ids):
             prev_index = self.prev_req_id_to_index.get(req_id)
             if prev_index is None:
@@ -955,15 +961,25 @@ class InputBatch:
                 # Final output id is not a placeholder, some tokens must have
                 # been discarded after a kv-load failure.
                 continue
-            if sampled_token_ids is None:
+
+            sampled_ids = sampled_token_ids_by_prev_index.get(prev_index)
+            if sampled_ids is None:
                 assert self.async_copy_ready_event is not None
-                self.async_copy_ready_event.synchronize()
-                sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+                if not copy_waited:
+                    _event_synchronize_if_needed(self.async_copy_ready_event)
+                    copy_waited = True
+
+                row_ids = self.sampled_token_ids_cpu[prev_index].tolist()
+                if -1 in row_ids:
+                    row_ids = row_ids[: row_ids.index(-1)]
+                sampled_token_ids_by_prev_index[prev_index] = row_ids
+                sampled_ids = row_ids
+
             # Replace placeholder token id(s) with actual sampled id(s).
-            new_ids: list[int] = sampled_token_ids[prev_index]
+            new_ids = sampled_ids.copy()
             if not new_ids:
                 continue
-            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            num_sampled_ids = len(new_ids)
             # Also account for case where there may be a smaller number of
             # output placeholders (tokens can be discarded after a kv-load failure).
             first_placeholder = req_output_token_ids.index(-1)

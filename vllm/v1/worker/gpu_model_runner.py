@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -193,6 +194,12 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _event_synchronize_if_needed(event: torch.Event) -> None:
+    # Avoid a host-blocking synchronize call if the event has already completed.
+    if not event.query():
+        event.synchronize()
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -236,7 +243,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        _event_synchronize_if_needed(self.async_copy_ready_event)
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -297,7 +304,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        self.async_copy_ready_event.synchronize()
+        _event_synchronize_if_needed(self.async_copy_ready_event)
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
@@ -533,9 +540,30 @@ class GPUModelRunner(
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
+        self.prepare_inputs_events: list[torch.Event] | None = None
+        self._prepare_inputs_slot_initialized: list[bool] | None = None
+        self._prepare_inputs_active_slot = 0
+        # Defensive parsing for ring slots to prevent startup crash
+        raw_slots = os.getenv("VLLM_V1_INPUT_PREP_RING_SLOTS", "1")
+        try:
+            configured_slots = int(raw_slots)
+        except (ValueError, TypeError):
+            configured_slots = 1
+        
+        self.input_prep_num_slots = max(1, configured_slots)
+        if not self.use_async_scheduling:
+            self.input_prep_num_slots = 1
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
-            self.prepare_inputs_event = torch.Event()
+            if self.input_prep_num_slots > 1:
+                self.prepare_inputs_events = [
+                    torch.Event() for _ in range(self.input_prep_num_slots)
+                ]
+                self._prepare_inputs_slot_initialized = [
+                    False for _ in range(self.input_prep_num_slots)
+                ]
+            else:
+                self.prepare_inputs_event = torch.Event()
 
         # self.cudagraph_batch_sizes sorts in ascending order.
         if (
@@ -780,7 +808,23 @@ class GPUModelRunner(
             device=self.device,
             pin_memory=self.pin_memory,
             with_numpy=numpy,
+            num_slots=self.input_prep_num_slots,
         )
+
+    def _set_input_prep_slot(self, slot_idx: int) -> None:
+        """Sets the active slot for all managed multi-slot buffers."""
+        for value in self.__dict__.values():
+            # Handle direct buffer attributes
+            if isinstance(value, CpuGpuBuffer) and value.num_slots > 1:
+                value.set_slot(slot_idx)
+            
+            # FIX: Handle buffers nested in lists (e.g., multi-modal embed buffers)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, CpuGpuBuffer) and item.num_slots > 1:
+                        item.set_slot(slot_idx)
+                        
+        self._prepare_inputs_active_slot = slot_idx
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -2973,6 +3017,21 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
+        if self.prepare_inputs_events is not None:
+            num_slots = len(self.prepare_inputs_events)
+            next_slot = (self._prepare_inputs_active_slot + 1) % num_slots
+            initialized = self._prepare_inputs_slot_initialized
+            assert initialized is not None
+            if initialized[next_slot]:
+                _event_synchronize_if_needed(self.prepare_inputs_events[next_slot])
+            self._set_input_prep_slot(next_slot)
+            try:
+                yield
+            finally:
+                self.prepare_inputs_events[next_slot].record()
+                initialized[next_slot] = True
+            return
+
         if self.prepare_inputs_event is None:
             yield
             return
@@ -2980,7 +3039,7 @@ class GPUModelRunner(
         # Ensure prior step has finished with reused CPU tensors.
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
+        _event_synchronize_if_needed(self.prepare_inputs_event)
         try:
             yield
         finally:
@@ -3810,7 +3869,7 @@ class GPUModelRunner(
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
-        self.draft_token_ids_event.synchronize()
+        _event_synchronize_if_needed(self.draft_token_ids_event)
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
     def _copy_valid_sampled_token_count(
@@ -3841,7 +3900,7 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        sampled_count_event.synchronize()
+        _event_synchronize_if_needed(sampled_count_event)
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def propose_draft_token_ids(
@@ -5998,7 +6057,7 @@ class GPUModelRunner(
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
-        self.transfer_event.synchronize()
+        _event_synchronize_if_needed(self.transfer_event)
         return pinned.tolist()
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:

@@ -13,6 +13,11 @@ from vllm.v1.outputs import (
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 
 
+def _event_synchronize_if_needed(event: torch.cuda.Event) -> None:
+    if not event.query():
+        event.synchronize()
+
+
 class AsyncOutput(AsyncModelRunnerOutput):
     def __init__(
         self,
@@ -57,7 +62,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.copy_event.record(self.copy_stream)
 
     def get_output(self) -> ModelRunnerOutput:
-        self.copy_event.synchronize()
+        _event_synchronize_if_needed(self.copy_event)
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -86,7 +91,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
 @contextmanager
 def async_barrier(event: torch.cuda.Event | None):
     if event is not None:
-        event.synchronize()
+        _event_synchronize_if_needed(event)
     try:
         yield
     finally:

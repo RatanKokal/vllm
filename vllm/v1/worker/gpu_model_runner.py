@@ -193,6 +193,12 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 
+def _event_synchronize_if_needed(event: torch.Event) -> None:
+    # Avoid a host-blocking synchronize call if the event has already completed.
+    if not event.query():
+        event.synchronize()
+
+
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     def __init__(
@@ -236,7 +242,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        _event_synchronize_if_needed(self.async_copy_ready_event)
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
@@ -297,7 +303,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        self.async_copy_ready_event.synchronize()
+        _event_synchronize_if_needed(self.async_copy_ready_event)
 
         # Release the device tensors once the copy has completed.
         del self._raw_pooler_output
@@ -2980,7 +2986,7 @@ class GPUModelRunner(
         # Ensure prior step has finished with reused CPU tensors.
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
+        _event_synchronize_if_needed(self.prepare_inputs_event)
         try:
             yield
         finally:
@@ -3810,7 +3816,7 @@ class GPUModelRunner(
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
-        self.draft_token_ids_event.synchronize()
+        _event_synchronize_if_needed(self.draft_token_ids_event)
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
     def _copy_valid_sampled_token_count(
@@ -3841,7 +3847,7 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        sampled_count_event.synchronize()
+        _event_synchronize_if_needed(sampled_count_event)
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
     def propose_draft_token_ids(
@@ -5998,7 +6004,7 @@ class GPUModelRunner(
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
-        self.transfer_event.synchronize()
+        _event_synchronize_if_needed(self.transfer_event)
         return pinned.tolist()
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:

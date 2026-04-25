@@ -26,6 +26,11 @@ from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 
+def _event_synchronize_if_needed(event: torch.Event) -> None:
+    if not event.query():
+        event.synchronize()
+
+
 @dataclass
 class CachedRequestState:
     req_id: str
@@ -957,7 +962,7 @@ class InputBatch:
                 continue
             if sampled_token_ids is None:
                 assert self.async_copy_ready_event is not None
-                self.async_copy_ready_event.synchronize()
+                _event_synchronize_if_needed(self.async_copy_ready_event)
                 sampled_token_ids = self.sampled_token_ids_cpu.tolist()
             # Replace placeholder token id(s) with actual sampled id(s).
             new_ids: list[int] = sampled_token_ids[prev_index]

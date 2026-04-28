@@ -18,7 +18,22 @@ import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 from tqdm import tqdm
+
+def _timed_sync(event: torch.cuda.Event, name: str, step_counter: int = -1, warn_threshold_us: float = 500) -> float:
+    nvtx.range_push(f"sync:{name}")
+    t0 = time.perf_counter_ns()
+    event.synchronize()
+    t1 = time.perf_counter_ns()
+    elapsed_us = (t1 - t0) / 1000
+    nvtx.range_pop()
+    if elapsed_us > warn_threshold_us:
+        print(f"[SLOW SYNC] {name}: {elapsed_us:.1f} us at step {step_counter}")
+    return elapsed_us
+
+
+
 
 import vllm.envs as envs
 from vllm.attention.layer import Attention, MLAAttention
@@ -235,14 +250,20 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
         This function blocks until the copy is finished.
         """
+        nvtx.range_push("async_output.get_output")
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
+        
+        nvtx.range_push("copy_event.synchronize")
         self.async_copy_ready_event.synchronize()
+        nvtx.range_pop()
 
         # Release the device tensors once the copy has completed.
         del self._logprobs_tensors
         del self._sampled_token_ids
         if max_gen_len == 1:
+            nvtx.range_push("sampled_token_ids.tolist")
             valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            nvtx.range_pop()
             for i in self._invalid_req_indices:
                 valid_sampled_token_ids[i].clear()
             logprobs_lists = None
@@ -259,6 +280,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        nvtx.range_pop()
         return output
 
 
@@ -2980,7 +3002,7 @@ class GPUModelRunner(
         # Ensure prior step has finished with reused CPU tensors.
         # This is required in the async scheduling case because
         # the CPU->GPU transfer happens async.
-        self.prepare_inputs_event.synchronize()
+        _timed_sync(self.prepare_inputs_event, "prepare_inputs", getattr(self, "_step_counter", -1))
         try:
             yield
         finally:
@@ -3272,6 +3294,48 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if not hasattr(self, '_step_counter'):
+            self._step_counter = 0
+            self._sync_log = []
+        nvtx.range_push(f"execute_model_step_{self._step_counter}")
+        result = self._execute_model_impl(scheduler_output, intermediate_tensors)
+        nvtx.range_pop()
+        
+        if self._step_counter % 100 == 0 and len(self._sync_log) > 0:
+            slow = [(s, n, d) for s, n, d in self._sync_log if d > 1000]
+            if len(slow) > 0:
+                print(f"Slow syncs in last 100 steps: {len(slow)}")
+                for s, n, d in slow:
+                    print(f"  step={s} sync={n} duration={d:.0f}us")
+            self._sync_log.clear()
+        return result
+
+    def _execute_model_impl(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if not hasattr(self, '_step_counter'):
+            self._step_counter = 0
+            self._sync_log = []
+        nvtx.range_push(f"execute_model_step_{self._step_counter}")
+        result = self._execute_model_impl(scheduler_output, intermediate_tensors)
+        nvtx.range_pop()
+        
+        if self._step_counter % 100 == 0 and len(self._sync_log) > 0:
+            slow = [(s, n, d) for s, n, d in self._sync_log if d > 1000]
+            if len(slow) > 0:
+                print(f"Slow syncs in last 100 steps: {len(slow)}")
+                for s, n, d in slow:
+                    print(f"  step={s} sync={n} duration={d:.0f}us")
+            self._sync_log.clear()
+        return result
+
+    def _execute_model_impl(
         self,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
@@ -3579,8 +3643,20 @@ class GPUModelRunner(
         self.kv_connector_output = kv_connector_output
         return None
 
-    @torch.inference_mode
+    @torch.inference_mode()
     def sample_tokens(
+        self, grammar_output: "GrammarOutput | None"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if not hasattr(self, '_step_counter'):
+            self._step_counter = 0
+            self._sync_log = []
+        nvtx.range_push(f"sample_tokens_step_{self._step_counter}")
+        self._step_counter += 1
+        result = self._sample_tokens_impl(grammar_output)
+        nvtx.range_pop()
+        return result
+
+    def _sample_tokens_impl(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
@@ -3810,7 +3886,7 @@ class GPUModelRunner(
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
-        self.draft_token_ids_event.synchronize()
+        _timed_sync(self.draft_token_ids_event, "draft_token", getattr(self, "_step_counter", -1))
         return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
 
     def _copy_valid_sampled_token_count(
@@ -5989,17 +6065,26 @@ class GPUModelRunner(
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         # This is a short term mitigation for issue mentioned in
         # https://github.com/vllm-project/vllm/issues/22754.
-        # `tolist` would trigger a cuda wise stream sync, which
-        # would block other copy ops from other cuda streams.
-        # A cuda event sync would avoid such a situation. Since
-        # this is in the critical path of every single model
-        # forward loop, this has caused perf issue for a disagg
-        # setup.
+        nvtx.range_push("_to_list")
+        nvtx.range_push("pinned_copy_nonblocking")
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
+        nvtx.range_pop()
+        
+        nvtx.range_push("transfer_event.record")
         self.transfer_event.record()
-        self.transfer_event.synchronize()
-        return pinned.tolist()
+        nvtx.range_pop()
+        
+        elapsed = _timed_sync(self.transfer_event, "transfer_event.synchronize", getattr(self, "_step_counter", -1))
+        if hasattr(self, "_sync_log"):
+            self._sync_log.append((getattr(self, "_step_counter", -1), "transfer", elapsed))
+        
+        nvtx.range_push("pinned.tolist")
+        result = pinned.tolist()
+        nvtx.range_pop()
+        
+        nvtx.range_pop()
+        return result
 
     def get_encoder_timing_stats(self) -> dict[str, dict[str, float | int]]:
         """

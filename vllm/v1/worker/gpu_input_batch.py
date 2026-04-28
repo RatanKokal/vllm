@@ -1,3 +1,4 @@
+import torch.cuda.nvtx as nvtx
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
@@ -7,6 +8,8 @@ from typing import cast
 
 import numpy as np
 import torch
+import torch.cuda.nvtx as nvtx
+import torch.cuda.nvtx as nvtx
 
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import MultiModalFeatureSpec
@@ -957,8 +960,14 @@ class InputBatch:
                 continue
             if sampled_token_ids is None:
                 assert self.async_copy_ready_event is not None
+                nvtx.range_push("update_async_output_token_ids")
+                nvtx.range_push("async_copy_ready_event.synchronize")
                 self.async_copy_ready_event.synchronize()
+                nvtx.range_pop()
+                nvtx.range_push("sampled_token_ids_cpu.tolist")
                 sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+                nvtx.range_pop()
+                nvtx.range_pop()
             # Replace placeholder token id(s) with actual sampled id(s).
             new_ids: list[int] = sampled_token_ids[prev_index]
             if not new_ids:

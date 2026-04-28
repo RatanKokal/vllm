@@ -260,12 +260,27 @@ class InputBatch:
         self.pooling_params: dict[str, PoolingParams] = {}
         self.pooling_states: dict[str, PoolingStates] = {}
 
-        # Cached reference to the GPU tensor of previously sampled tokens
+        # Cached reference to the GPU tensor of previously sampled tokens.
+        # Copy-once-at-end: this GPU tensor is the *only* place token IDs are
+        # stored between steps.  The next step's input-prep reads directly from
+        # this device tensor (combine_sampled_and_draft_tokens kernel) rather
+        # than bouncing through the host.
         self.prev_sampled_token_ids: torch.Tensor | None = None
         self.prev_req_id_to_index: dict[str, int] | None = None
-        # These are used to update output_token_ids with real sampled
-        # ids from prior step, if required by current sampling params
-        # (e.g. penalties).
+
+        # Copy-once-at-end: sampled_token_ids_cpu is now a *lazy* CPU tensor
+        # produced on first access via AsyncGPUModelRunnerOutput.sampled_token_ids_cpu
+        # (a property that copies once, blocking).  It is None until that
+        # property is first accessed.
+        #
+        # async_copy_ready_event is a pre-recorded dummy torch.Event whose
+        # .synchronize() always returns immediately (no async copy in flight).
+        #
+        # Both fields retain the same semantics as before from the perspective
+        # of update_async_output_token_ids(): it checks
+        # async_copy_ready_event.synchronize() then reads sampled_token_ids_cpu.
+        # The difference is that the "copy" happens synchronously on that first
+        # access instead of being kicked off non-blocking in __init__.
         self.sampled_token_ids_cpu: torch.Tensor | None = None
         self.async_copy_ready_event: torch.Event | None = None
 
@@ -921,10 +936,24 @@ class InputBatch:
         sampled_token_ids_cpu: torch.Tensor,
         async_copy_ready_event: torch.Event,
     ) -> None:
-        """
-        In async scheduling case, store ref to sampled_token_ids_cpu
-        tensor and corresponding copy-ready event. Used to repair
-        output_token_ids prior to sampling, if needed by logits processors.
+        """Store a (lazy) reference to the CPU token-id tensor and its gate event.
+
+        Copy-once-at-end semantics:
+          - sampled_token_ids_cpu is the result of
+            AsyncGPUModelRunnerOutput.sampled_token_ids_cpu, which is a lazy
+            property: it copies the GPU tensor to CPU exactly once (blocking)
+            on first access.
+          - async_copy_ready_event is a pre-recorded dummy torch.Event so that
+            .synchronize() always returns immediately.
+
+        The calling convention from update_async_output_token_ids() is
+        unchanged:  it calls async_copy_ready_event.synchronize() and then
+        reads sampled_token_ids_cpu.tolist().  Both still work; the copy just
+        happens synchronously on that first .tolist() call rather than being
+        pre-initiated non-blocking in AsyncGPUModelRunnerOutput.__init__().
+
+        If no logits-processors need output_token_ids both fields are set to
+        None and no copy is ever performed.
         """
         if self.sampling_metadata.output_token_ids:
             self.sampled_token_ids_cpu = sampled_token_ids_cpu

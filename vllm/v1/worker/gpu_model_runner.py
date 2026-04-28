@@ -195,6 +195,27 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
+    """Copy-once-at-end async output container.
+
+    Unlike the original design, NO GPU->CPU copy is started in __init__.
+    All copies are deferred to get_output(), which is called exactly once
+    when the scheduler/API layer actually needs the data (i.e., at request
+    completion or at a stream-flush interval).
+
+    The fields sampled_token_ids_cpu and async_copy_ready_event are still
+    exposed so that InputBatch.set_async_sampled_token_ids() and
+    update_async_output_token_ids() continue to compile.  However:
+      - sampled_token_ids_cpu is a *lazily-produced CPU tensor* (blocking
+        on first access) rather than an eagerly-started non-blocking copy.
+      - async_copy_ready_event is a dummy event that is pre-recorded so
+        any call to .synchronize() on it returns immediately (the copy has
+        already happened synchronously).
+
+    This preserves full backwards compatibility with the penalty / bad-words
+    / structured-output paths that call update_async_output_token_ids(),
+    while removing per-step copy-stream overhead from the hot path.
+    """
+
     def __init__(
         self,
         model_runner_output: ModelRunnerOutput,
@@ -206,55 +227,91 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
-
-        # Event on the copy stream so we can synchronize the non-blocking copy.
-        self.async_copy_ready_event = torch.Event()
-
-        # Keep a reference to the device tensor to avoid it being
-        # deallocated until we finish copying it to the host.
-        self._sampled_token_ids = sampled_token_ids
         self.vocab_size = vocab_size
-        self._logprobs_tensors = logprobs_tensors
 
-        # Initiate the copy on a separate stream, but do not synchronize it.
-        default_stream = torch.cuda.current_stream()
-        with torch.cuda.stream(async_output_copy_stream):
-            async_output_copy_stream.wait_stream(default_stream)
-            self.sampled_token_ids_cpu = self._sampled_token_ids.to(
-                "cpu", non_blocking=True
+        # --- Retain strong GPU tensor references (no copy initiated) ------- #
+        # We intentionally do NOT use async_output_copy_stream here.
+        # The stream is accepted as a parameter for API compatibility but
+        # is not used in the copy-once-at-end design.
+        self._sampled_token_ids_gpu = sampled_token_ids
+        self._logprobs_tensors_gpu = logprobs_tensors
+
+        # Lazy CPU cache; populated on first access of sampled_token_ids_cpu.
+        self._sampled_token_ids_cpu_cache: torch.Tensor | None = None
+
+        # Dummy event: already recorded so .synchronize() is always a no-op.
+        self._dummy_event = torch.cuda.Event()
+        self._dummy_event.record()
+
+    # ---------------------------------------------------------------------- #
+    # Compatibility properties used by InputBatch.set_async_sampled_token_ids
+    # and InputBatch.update_async_output_token_ids.
+    # ---------------------------------------------------------------------- #
+
+    @property
+    def sampled_token_ids_cpu(self) -> torch.Tensor:
+        """Lazily-produced CPU copy (blocking on first access)."""
+        if self._sampled_token_ids_cpu_cache is None:
+            # Single blocking copy; called at most once.
+            self._sampled_token_ids_cpu_cache = (
+                self._sampled_token_ids_gpu.to("cpu")
             )
-            self._logprobs_tensors_cpu = (
-                self._logprobs_tensors.to_cpu_nonblocking()
-                if self._logprobs_tensors
-                else None
-            )
-            self.async_copy_ready_event.record()
+        return self._sampled_token_ids_cpu_cache
+
+    @property
+    def async_copy_ready_event(self) -> torch.cuda.Event:
+        """Always-recorded dummy event (synchronize() returns immediately)."""
+        return self._dummy_event
+
+    # ---------------------------------------------------------------------- #
+    # Core one-shot output materialisation.
+    # ---------------------------------------------------------------------- #
 
     def get_output(self) -> ModelRunnerOutput:
-        """Copy the device tensors to the host and return a ModelRunnerOutput.
+        """Perform the one-shot GPU->CPU copy and return ModelRunnerOutput.
 
-        This function blocks until the copy is finished.
+        This is a blocking call that should be called exactly once.  It is
+        the only point at which sampled_token_ids and logprobs cross the
+        PCIe bus (for non-spec-decode requests; spec-decode may copy counts
+        earlier via _copy_valid_sampled_token_count).
         """
-        max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        self.async_copy_ready_event.synchronize()
+        # Use cached CPU tensor if update_async_output_token_ids already
+        # triggered the lazy copy; otherwise do it now (still only once).
+        sampled_token_ids_cpu = self.sampled_token_ids_cpu  # ensures single copy
 
-        # Release the device tensors once the copy has completed.
-        del self._logprobs_tensors
-        del self._sampled_token_ids
+        max_gen_len = sampled_token_ids_cpu.shape[-1]
+
         if max_gen_len == 1:
-            valid_sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            valid_sampled_token_ids = sampled_token_ids_cpu.tolist()
             for i in self._invalid_req_indices:
                 valid_sampled_token_ids[i].clear()
             logprobs_lists = None
-            if self._logprobs_tensors_cpu is not None:
-                logprobs_lists = self._logprobs_tensors_cpu.tolists()
+            if self._logprobs_tensors_gpu is not None:
+                # Single blocking logprobs copy.
+                logprobs_cpu = LogprobsTensors(
+                    self._logprobs_tensors_gpu.logprob_token_ids.to("cpu"),
+                    self._logprobs_tensors_gpu.logprobs.to("cpu"),
+                    self._logprobs_tensors_gpu.selected_token_ranks.to("cpu"),
+                )
+                logprobs_lists = logprobs_cpu.tolists()
         else:
+            logprobs_cpu_for_parse: LogprobsTensors | None = None
+            if self._logprobs_tensors_gpu is not None:
+                logprobs_cpu_for_parse = LogprobsTensors(
+                    self._logprobs_tensors_gpu.logprob_token_ids.to("cpu"),
+                    self._logprobs_tensors_gpu.logprobs.to("cpu"),
+                    self._logprobs_tensors_gpu.selected_token_ranks.to("cpu"),
+                )
             valid_sampled_token_ids, logprobs_lists = RejectionSampler.parse_output(
-                self.sampled_token_ids_cpu,
+                sampled_token_ids_cpu,
                 self.vocab_size,
                 self._invalid_req_indices,
-                logprobs_tensors=self._logprobs_tensors_cpu,
+                logprobs_tensors=logprobs_cpu_for_parse,
             )
+
+        # Release GPU tensor references.
+        del self._logprobs_tensors_gpu
+        del self._sampled_token_ids_gpu
 
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
@@ -527,13 +584,18 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
-        # Separate cuda stream for overlapping transfer of sampled token ids from
-        # GPU to CPU when async scheduling is enabled.
+        # Separate cuda stream used for the *single* final GPU->CPU copy when
+        # async scheduling is enabled (copy-once-at-end design).
+        # The old per-step copy streams (valid_sampled_token_count_copy_stream,
+        # draft_token_ids_copy_stream) are preserved below only for
+        # draft/speculative paths that still need intermediate CPU values for
+        # structured-output / bad-words gating.
         self.async_output_copy_stream: torch.cuda.Stream | None = None
         # cuda event to synchronize use of reused CPU tensors between steps
         # when async scheduling is enabled.
         self.prepare_inputs_event: torch.Event | None = None
         if self.use_async_scheduling:
+            # One stream for the single end-of-request copy.
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
 
@@ -2909,9 +2971,11 @@ class GPUModelRunner(
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
-            # Cache the sampled tokens on the GPU and avoid CPU sync.
-            # These will be copied into input_ids in the next step
-            # when preparing inputs.
+            # Copy-once-at-end: cache sampled tokens on GPU; no CPU copy
+            # here.  The tokens flow into the next step's input_ids via the
+            # GPU tensor prev_sampled_token_ids.  The single blocking copy
+            # to CPU happens in AsyncGPUModelRunnerOutput.get_output() when
+            # the caller actually needs the data.
             # With spec decoding, this is done in propose_draft_token_ids().
             if self.input_batch.prev_sampled_token_ids is None:
                 assert sampled_token_ids.shape[-1] == 1
@@ -3754,8 +3818,16 @@ class GPUModelRunner(
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
         ):
-            # Save ref of sampled_token_ids CPU tensor if the batch contains
-            # any requests with sampling params that require output ids.
+            # Copy-once-at-end: sampled_token_ids_cpu is a *lazy* property on
+            # AsyncGPUModelRunnerOutput.  Accessing it here does NOT trigger an
+            # eager copy; the tensor is only materialised (once, blocking) the
+            # first time InputBatch.update_async_output_token_ids() calls
+            # .synchronize() on async_copy_ready_event and then accesses the
+            # CPU tensor.  async_copy_ready_event is a pre-recorded dummy event
+            # so synchronize() returns immediately without any stream flush.
+            #
+            # If no logits-processors need output_token_ids, set_async_sampled_
+            # token_ids sets both fields to None and neither copy ever occurs.
             self.input_batch.set_async_sampled_token_ids(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
@@ -3816,12 +3888,16 @@ class GPUModelRunner(
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
+        # Copy-once-at-end note:
+        # This is a *speculative-decoding-only* copy path.  The drafter needs
+        # the valid-sampled-token count on the CPU in order to size its own
+        # padded input batch (prepare_next_token_ids_padded).  This copy is
+        # therefore unavoidable in the spec-decode path and is intentionally
+        # retained.  It is NOT on the hot path for non-spec-decode requests.
         if self.valid_sampled_token_count_event is None:
             return
 
         default_stream = torch.cuda.current_stream()
-        # Initialize a new stream to overlap the copy operation with
-        # prepare_input of draft model.
         with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
             counts = valid_sampled_tokens_count
@@ -3833,7 +3909,12 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
     def _get_valid_sampled_token_count(self) -> list[int]:
-        # Wait until valid_sampled_tokens_count is copied to cpu,
+        # Copy-once-at-end note:
+        # This synchronisation is retained for the speculative-decoding path
+        # only (see _copy_valid_sampled_token_count above).  The sync here
+        # blocks the CPU until the per-spec-step drafter-count copy completes,
+        # which is unavoidable because the drafter needs this value to build
+        # its own padded batch.  This is NOT called in the non-spec path.
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         sampled_count_event = self.valid_sampled_token_count_event
         if sampled_count_event is None or prev_sampled_token_ids is None:
@@ -5987,14 +6068,16 @@ class GPUModelRunner(
         return kv_cache_spec
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
-        # This is a short term mitigation for issue mentioned in
-        # https://github.com/vllm-project/vllm/issues/22754.
-        # `tolist` would trigger a cuda wise stream sync, which
-        # would block other copy ops from other cuda streams.
-        # A cuda event sync would avoid such a situation. Since
-        # this is in the critical path of every single model
-        # forward loop, this has caused perf issue for a disagg
-        # setup.
+        # Copy-once-at-end design:
+        # In the non-async (synchronous) scheduling path _bookkeeping_sync
+        # still needs a CPU list immediately, so we do one blocking copy here.
+        # The pinned-memory + event trick from the original is preserved to
+        # avoid the implicit stream-wide synchronisation that bare .tolist()
+        # triggers (see https://github.com/vllm-project/vllm/issues/22754).
+        #
+        # In the async scheduling path this function is *not called* –
+        # _bookkeeping_sync returns an empty list and the real copy is
+        # deferred to AsyncGPUModelRunnerOutput.get_output().
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()

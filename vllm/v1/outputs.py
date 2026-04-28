@@ -148,6 +148,14 @@ class ECConnectorOutput:
 
 # ModelRunnerOutput is serialized and sent to the scheduler process.
 # This is expensive for torch.Tensor so prefer to use list instead.
+#
+# Copy-once-at-end design note:
+# In the async scheduling path, sampled_token_ids starts as an empty list []
+# during bookkeeping (set by _bookkeeping_sync) and is populated later in
+# AsyncGPUModelRunnerOutput.get_output() when the one-shot GPU->CPU copy
+# completes.  Callers (scheduler, API layer) must therefore call get_output()
+# on the AsyncModelRunnerOutput before reading sampled_token_ids.
+# The field type remains list[list[int]] – no struct change needed.
 @dataclass
 class ModelRunnerOutput:
     # [num_reqs]

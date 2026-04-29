@@ -139,6 +139,10 @@ class CudaGraphManager:
                 inputs_embeds=inputs_embeds,
             )
             self.hidden_states[:num_tokens] = hidden_states
+        
+        # Dump the captured graph to a DOT file for inspection
+        graph.debug_dump(f"vllm_cudagraph_{num_tokens}_tokens.dot")
+        print(f"Captured CUDAGraph for {num_tokens} tokens. Graph dumped to vllm_cudagraph_{num_tokens}_tokens.dot")
         self.graphs[num_tokens] = graph
 
     @torch.inference_mode()

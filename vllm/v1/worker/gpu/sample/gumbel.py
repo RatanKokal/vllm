@@ -105,7 +105,7 @@ def _gumbel_sample_kernel(
     tl.store(local_argmax_ptr + batch_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + batch_idx * local_max_stride + block_idx, value)
 
-
+@torch.compile(mode="reduce-overhead", fullgraph=True)
 def gumbel_sample(
     logits: torch.Tensor,  # [num_reqs, vocab_size]
     idx_mapping: torch.Tensor,  # [num_reqs]

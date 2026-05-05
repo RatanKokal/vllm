@@ -529,12 +529,17 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
+        import os
+        min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
+        # Force the scheduler to naturally exit early if queue hasn't reached threshold and nothing is running
+        force_wait = (len(self.running) == 0 and 0 < len(self.waiting) < min_queued_reqs)
+
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
+        if not preempted_reqs and not force_wait:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break

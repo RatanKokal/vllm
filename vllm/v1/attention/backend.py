@@ -297,6 +297,7 @@ class CommonAttentionMetadata:
     """(batch_size + 1,), the start location of each request in query Tensor"""
 
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
     """(batch_size,), the number of computed tokens for each request"""
 
     num_reqs: int

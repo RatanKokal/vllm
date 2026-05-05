@@ -537,7 +537,8 @@ class Scheduler(SchedulerInterface):
         if len(self.running) == 0 and 0 < len(self.waiting) < self._min_queued_reqs:
             # Check elapsed time from the oldest waiting request
             head_req = self.waiting.peek_request()
-            if (scheduled_timestamp - head_req.arrival_time) < self._min_queued_timeout_s:
+            # arrival_time is time.time(), but scheduled_timestamp is time.monotonic()
+            if (time.time() - head_req.arrival_time) < self._min_queued_timeout_s:
                 force_wait = True
 
         # Use a temporary RequestQueue to collect requests that need to be

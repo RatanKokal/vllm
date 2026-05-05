@@ -88,6 +88,10 @@ class Scheduler(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
 
+        import os
+        self._min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
+        self._min_queued_timeout_s = float(os.environ.get("VLLM_MIN_QUEUED_TIMEOUT", "0.2"))
+
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -529,10 +533,12 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        import os
-        min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
-        # Force the scheduler to naturally exit early if queue hasn't reached threshold and nothing is running
-        force_wait = (len(self.running) == 0 and 0 < len(self.waiting) < min_queued_reqs)
+        force_wait = False
+        if len(self.running) == 0 and 0 < len(self.waiting) < self._min_queued_reqs:
+            # Check elapsed time from the oldest waiting request
+            head_req = self.waiting.peek_request()
+            if (scheduled_timestamp - head_req.arrival_time) < self._min_queued_timeout_s:
+                force_wait = True
 
         # Use a temporary RequestQueue to collect requests that need to be
         # skipped and put back at the head of the waiting queue later

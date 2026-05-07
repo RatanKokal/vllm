@@ -333,6 +333,7 @@ class CommonAttentionMetadata:
     """(batch_size + 1,), the start location of each request in query Tensor"""
 
     seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
     """(batch_size,), the number of computed tokens for each request"""
 
     num_reqs: int
@@ -368,7 +369,6 @@ class CommonAttentionMetadata:
     distinguish actual decodes from short extends."""
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
-    _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
 
     _num_computed_tokens_cache: torch.Tensor | None = None
@@ -384,19 +384,7 @@ class CommonAttentionMetadata:
         return replace(self, **kwargs)
 
     @property
-    @deprecated(
-        """
-    Prefer using device seq_lens directly to avoid implicit H<>D sync.
-    If a CPU copy is needed, use `seq_lens.cpu()` instead.
-    Will be removed in a future release, please migrate as soon as possible.
-    """
-    )
-    def seq_lens_cpu(self) -> torch.Tensor:
-        if self._seq_lens_cpu is None:
-            self._seq_lens_cpu = self.seq_lens.to("cpu")
-        return self._seq_lens_cpu
 
-    @property
     @deprecated(
         """
     Prefer using device seq_lens directly to avoid implicit H<>D sync which breaks full
@@ -429,9 +417,7 @@ class CommonAttentionMetadata:
             query_start_loc=self.query_start_loc[: num_actual_reqs + 1],
             query_start_loc_cpu=self.query_start_loc_cpu[: num_actual_reqs + 1],
             seq_lens=self.seq_lens[:num_actual_reqs],
-            _seq_lens_cpu=self._seq_lens_cpu[:num_actual_reqs]
-            if self._seq_lens_cpu is not None
-            else None,
+            seq_lens_cpu=self.seq_lens_cpu[:num_actual_reqs],
             _num_computed_tokens_cpu=self._num_computed_tokens_cpu[:num_actual_reqs]
             if self._num_computed_tokens_cpu is not None
             else None,

@@ -2180,7 +2180,7 @@ class GPUModelRunner(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
             seq_lens=self.seq_lens[:num_reqs_padded],
-            _seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu=seq_lens_cpu,
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,

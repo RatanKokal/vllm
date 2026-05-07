@@ -92,6 +92,10 @@ class Scheduler(SchedulerInterface):
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
 
+        import os
+        self._min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
+        self._min_queued_timeout_s = float(os.environ.get("VLLM_MIN_QUEUED_TIMEOUT", "0.2"))
+
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -561,7 +565,15 @@ class Scheduler(SchedulerInterface):
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
+        force_wait = False
+        if len(self.running) == 0 and 0 < len(self.waiting) < self._min_queued_reqs:
+            # Check elapsed time from the oldest waiting request
+            head_req = self.waiting.peek_request()
+            # arrival_time is time.time(), but scheduled_timestamp is time.monotonic()
+            if (time.time() - head_req.arrival_time) < self._min_queued_timeout_s:
+                force_wait = True
+
+        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED and not force_wait:
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:

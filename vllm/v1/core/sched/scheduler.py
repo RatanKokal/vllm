@@ -60,6 +60,26 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+class RowAllocator:
+    """O(1) free-list allocator for persistent state table row indices.
+    Each admitted request holds its row for its entire lifetime,
+    surviving condense(), reordering, and async scheduling steps.
+    """
+    def __init__(self, max_rows: int) -> None:
+        # Stack order is irrelevant; pop from end is O(1).
+        self._free: list[int] = list(range(max_rows - 1, -1, -1))
+
+    def alloc(self) -> int:
+        if not self._free:
+            raise RuntimeError(
+                "RowAllocator exhausted: active requests exceed max_num_seqs"
+            )
+        return self._free.pop()
+
+    def free(self, row_id: int) -> None:
+        self._free.append(row_id)
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -151,6 +171,8 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        self._row_allocator = RowAllocator(self.scheduler_config.max_num_seqs)
+        self._req_id_to_row: dict[str, int] = {}
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -763,6 +785,9 @@ class Scheduler(SchedulerInterface):
                 self._update_connector_prefix_cache_stats(request)
 
                 self.running.append(request)
+                if request.request_id not in self._req_id_to_row:
+                    self._req_id_to_row[request.request_id] = \
+                        self._row_allocator.alloc()
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -834,21 +859,23 @@ class Scheduler(SchedulerInterface):
         if self.use_v2_model_runner:
             scheduled_new_reqs = scheduled_new_reqs + scheduled_resumed_reqs
             scheduled_resumed_reqs = []
-            new_reqs_data = [
-                NewRequestData.from_request(
+            new_reqs_data = []
+            for req in scheduled_new_reqs:
+                nrd = NewRequestData.from_request(
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
                 )
-                for req in scheduled_new_reqs
-            ]
+                nrd.row_id = self._req_id_to_row[req.request_id]
+                new_reqs_data.append(nrd)
         else:
-            new_reqs_data = [
-                NewRequestData.from_request(
+            new_reqs_data = []
+            for req in scheduled_new_reqs:
+                nrd = NewRequestData.from_request(
                     req, req_to_new_blocks[req.request_id].get_block_ids()
                 )
-                for req in scheduled_new_reqs
-            ]
+                nrd.row_id = self._req_id_to_row[req.request_id]
+                new_reqs_data.append(nrd)
 
         with record_function_or_nullcontext("schedule: make_cached_request_data"):
             cached_reqs_data = self._make_cached_request_data(
@@ -1045,6 +1072,7 @@ class Scheduler(SchedulerInterface):
         return CachedRequestData(
             req_ids=req_ids,
             resumed_req_ids=resumed_req_ids,
+            row_ids=[self._req_id_to_row[r] for r in req_ids],
             new_token_ids=new_token_ids,
             all_token_ids=all_token_ids,
             new_block_ids=new_block_ids,
@@ -1699,6 +1727,9 @@ class Scheduler(SchedulerInterface):
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
+        _row = self._req_id_to_row.pop(request_id, None)
+        if _row is not None:
+            self._row_allocator.free(_row)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 

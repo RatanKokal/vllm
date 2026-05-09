@@ -48,6 +48,7 @@ class CachedRequestState:
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
+    row_id: int = -1
 
     # for pooling models
     pooling_params: PoolingParams | None = None
@@ -148,6 +149,23 @@ class InputBatch:
             kernel_block_sizes=kernel_block_sizes,
             max_num_blocks=max_num_blocks_per_req,
             cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        )
+
+        # Persistent state table: indexed by stable row_id, not contiguous
+        # req_index. Survives condense(), reordering, and preemption.
+        self.persistent_block_table = MultiGroupBlockTable(
+            max_num_reqs=max_num_reqs,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            pin_memory=pin_memory,
+            device=device,
+            block_sizes=block_sizes,
+            kernel_block_sizes=kernel_block_sizes,
+            max_num_blocks=max_num_blocks_per_req,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+        )
+        self.num_computed_tokens_persistent = np.zeros(
+            max_num_reqs, dtype=np.int32
         )
 
         # Sampling-related.

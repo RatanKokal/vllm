@@ -114,6 +114,10 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        cpu_block_ids = torch.tensor(block_ids, dtype=torch.int32, device="cpu")
+        self.block_table.gpu[row_idx, start : start + num_blocks].copy_(
+            cpu_block_ids,
+        )
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -123,12 +127,19 @@ class BlockTable:
         num_blocks = self.num_blocks_per_row[src]
         block_table_np = self.block_table.np
         block_table_np[tgt, :num_blocks] = block_table_np[src, :num_blocks]
+        self.block_table.gpu[tgt, :num_blocks].copy_(
+            self.block_table.gpu[src, :num_blocks],
+            non_blocking=True,
+        )
         self.num_blocks_per_row[tgt] = num_blocks
 
     def swap_row(self, src: int, tgt: int) -> None:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        tmp = self.block_table.gpu[src].clone()
+        self.block_table.gpu[src] = self.block_table.gpu[tgt]
+        self.block_table.gpu[tgt] = tmp
 
     def compute_slot_mapping(
         self, req_indices: np.ndarray, positions: np.ndarray
@@ -191,7 +202,7 @@ class BlockTable:
             )
 
     def commit_block_table(self, num_reqs: int) -> None:
-        self.block_table.copy_to_gpu(num_reqs)
+        return
 
     def commit_slot_mapping(self, num_tokens: int) -> None:
         self.slot_mapping.copy_to_gpu(num_tokens)
@@ -307,9 +318,18 @@ class MultiGroupBlockTable:
         for i, block_table in enumerate(self.block_tables):
             block_table.append_row(block_ids[i], row_idx)
 
-    def add_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
-        for i, block_table in enumerate(self.block_tables):
-            block_table.add_row(block_ids[i], row_idx)
+    def add_row(
+        self,
+        block_ids: tuple[list[int], ...] | None,
+        row_idx: int,
+    ) -> None:
+        """Reset and populate a row (preemption+resume: replace, not append).
+        Delegates to BlockTable.add_row which zeroes num_blocks_per_row first.
+        """
+        if block_ids is None:
+            return
+        for block_table, ids in zip(self.block_tables, block_ids):
+            block_table.add_row(list(ids), row_idx)
 
     def move_row(self, src: int, tgt: int) -> None:
         for block_table in self.block_tables:

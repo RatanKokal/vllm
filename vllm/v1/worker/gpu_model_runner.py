@@ -560,6 +560,14 @@ class GPUModelRunner(
             self.max_num_reqs + 1, dtype=torch.int32
         )
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # Persistent seq_lens indexed by stable row_id.
+        self.seq_lens_persistent_gpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=self.device
+        )
+        # Contiguous batch positions -> stable row_id.
+        self.active_row_ids = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int64
+        )
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
@@ -863,6 +871,8 @@ class GPUModelRunner(
         """
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
+            if (req_state := self.requests.get(req_id)) is not None and req_state.row_id >= 0:
+                self.seq_lens_persistent_gpu[req_state.row_id] = 0
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
@@ -907,6 +917,11 @@ class GPUModelRunner(
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
+                if req_state.row_id >= 0:
+                    self.seq_lens_persistent_gpu[req_state.row_id] = (
+                        req_state.num_computed_tokens
+                        + scheduler_output.num_scheduled_tokens.get(req_id, 0)
+                    )
                 reqs_to_add.append(req_state)
                 continue
 
@@ -943,8 +958,23 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                row_id=new_req_data.row_id,
             )
             self.requests[req_id] = req_state
+
+            # Initialise the persistent batch entry immediately on admission.
+            # This covers prefix-cached requests where num_computed_tokens > 0.
+            self.input_batch.num_computed_tokens_persistent[
+                req_state.row_id
+            ] = new_req_data.num_computed_tokens
+            self.seq_lens_persistent_gpu[req_state.row_id] = (
+                new_req_data.num_computed_tokens
+                + scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            )
+            if new_req_data.block_ids:
+                self.input_batch.persistent_block_table.add_row(
+                    new_req_data.block_ids, req_state.row_id
+                )
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -978,6 +1008,8 @@ class GPUModelRunner(
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            seq_len = num_computed_tokens + num_scheduled_tokens
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
@@ -1006,6 +1038,9 @@ class GPUModelRunner(
 
             # Update the cached states.
             req_state.num_computed_tokens = num_computed_tokens
+            row_id = req_state.row_id
+            num_sched = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            self.seq_lens_persistent_gpu[row_id] = num_computed_tokens + num_sched
 
             if not is_last_rank:
                 # When using PP, the scheduler sends the sampled tokens back,
@@ -1051,6 +1086,16 @@ class GPUModelRunner(
                 # The request was either preempted and resumed later, or was not
                 # scheduled in the previous step and needs to be added again.
 
+                assert row_id >= 0, (
+                    f"req {req_id} has row_id=-1 on re-admission to batch"
+                )
+                self.input_batch.num_computed_tokens_persistent[row_id] = \
+                    num_computed_tokens
+                self.seq_lens_persistent_gpu[row_id] = seq_len
+                self.input_batch.persistent_block_table.add_row(
+                    req_state.block_ids, row_id
+                )
+
                 if self.use_async_scheduling and num_output_tokens > 0:
                     # We must recover the output token ids for resumed requests in the
                     # async scheduling case, so that correct input_ids are obtained.
@@ -1062,8 +1107,15 @@ class GPUModelRunner(
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+            self.input_batch.num_computed_tokens_persistent[row_id] = \
+                num_computed_tokens
+            self.seq_lens_persistent_gpu[row_id] = seq_len
+
             if new_block_ids is not None:
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+                self.input_batch.persistent_block_table.append_row(
+                    new_block_ids, row_id
+                )
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -1440,9 +1492,17 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table.commit_block_table(num_reqs)
+        # Build active_row_ids: contiguous batch position -> stable row_id.
+        active_row_ids_np = self.active_row_ids.np[:num_reqs]
+        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            active_row_ids_np[i] = self.requests[req_id].row_id
+        self.active_row_ids.copy_to_gpu(num_reqs)
+        active_row_ids_gpu = self.active_row_ids.gpu[:num_reqs]
+
+        seq_lens_cpu = (
+            self.input_batch.num_computed_tokens_persistent[active_row_ids_np]
+            + num_scheduled_tokens[:num_reqs]
+        )
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -1547,12 +1607,15 @@ class GPUModelRunner(
         self.query_start_loc.copy_to_gpu()
         query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
 
-        self.seq_lens.np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+        torch.index_select(
+            self.seq_lens_persistent_gpu,
+            0,
+            active_row_ids_gpu,
+            out=self.seq_lens.gpu[:num_reqs],
         )
-        # Fill unused with 0 for full cuda graph mode.
+        self.seq_lens.gpu[num_reqs:].fill_(0)
+        self.seq_lens.np[:num_reqs] = seq_lens_cpu
         self.seq_lens.np[num_reqs:].fill(0)
-        self.seq_lens.copy_to_gpu()
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -1646,6 +1709,7 @@ class GPUModelRunner(
         num_tokens: int,
         num_reqs: int,
         max_query_len: int,
+        active_row_ids_gpu: torch.Tensor,
         num_tokens_padded: int | None = None,
         num_reqs_padded: int | None = None,
         ubatch_slices: UBatchSlices | None = None,
@@ -1698,8 +1762,17 @@ class GPUModelRunner(
                     device=self.device,
                 )
             else:
-                blk_table = self.input_batch.block_table[kv_cache_gid]
-                blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
+                pers_bt = self.input_batch.persistent_block_table[kv_cache_gid]
+                cont_bt = self.input_batch.block_table[kv_cache_gid]
+                torch.index_select(
+                    pers_bt.block_table.gpu,
+                    0,
+                    active_row_ids_gpu,
+                    out=cont_bt.block_table.gpu[:num_reqs],
+                )
+                if num_reqs_padded > num_reqs:
+                    cont_bt.block_table.gpu[num_reqs:num_reqs_padded].fill_(-1)
+                blk_table_tensor = cont_bt.block_table.gpu[:num_reqs_padded]
 
             # Fill unused with -1. Needed for reshape_and_cache in full cuda
             # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
@@ -3438,6 +3511,12 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
+            active_row_ids_np = self.active_row_ids.np[:num_reqs]
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                active_row_ids_np[i] = self.requests[req_id].row_id
+            self.active_row_ids.copy_to_gpu(num_reqs)
+            active_row_ids_gpu = self.active_row_ids.gpu[:num_reqs]
+
             attn_metadata, spec_decode_common_attn_metadata = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
@@ -3451,6 +3530,7 @@ class GPUModelRunner(
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
+                    active_row_ids_gpu=active_row_ids_gpu,
                 )
             )
 
@@ -4616,6 +4696,12 @@ class GPUModelRunner(
             self.query_start_loc.copy_to_gpu()
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+            active_row_ids_np = self.active_row_ids.np[:num_reqs]
+            for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                active_row_ids_np[i] = self.requests[req_id].row_id
+            self.active_row_ids.copy_to_gpu(num_reqs)
+            active_row_ids_gpu = self.active_row_ids.gpu[:num_reqs]
+
             attn_metadata, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs_padded,
@@ -4623,6 +4709,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
                 slot_mappings=slot_mappings_by_group,
+                active_row_ids_gpu=active_row_ids_gpu,
             )
 
         with self.maybe_dummy_run_with_lora(

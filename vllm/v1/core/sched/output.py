@@ -41,6 +41,7 @@ class NewRequestData:
     num_computed_tokens: int
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
+    row_id: int = -1
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -117,6 +118,7 @@ class CachedRequestData:
     # the request's block IDs. For those in the set, new_block_ids will be used as the
     # request's block IDs instead of appending to the existing block IDs.
     resumed_req_ids: set[str]
+    row_ids: list[int]
     # NOTE(woosuk): new_token_ids is only used for pipeline parallelism.
     # When PP is not used, new_token_ids will be empty.
     new_token_ids: list[list[int]]
@@ -171,6 +173,7 @@ class CachedRequestData:
         return cls(
             req_ids=[],
             resumed_req_ids=set(),
+            row_ids=[],
             new_token_ids=[],
             all_token_ids={},
             new_block_ids=[],

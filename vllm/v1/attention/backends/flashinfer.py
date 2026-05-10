@@ -507,7 +507,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.prefill_fixed_split_size = 4096
             self.disable_split_kv = True
         else:
-            self.decode_fixed_split_size = -1
+            self.decode_fixed_split_size = None
             self.prefill_fixed_split_size = -1
             self.disable_split_kv = False
 
@@ -708,7 +708,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 # Tensor cores are enabled by default because the perf would be
                 # at least as good as cuda cores for all attention ops in latest
                 # gpus.
-                use_tensor_cores=True,
+                use_tensor_cores=False,
             )
 
             # save the decode wrapper
@@ -1678,18 +1678,17 @@ def fast_plan_decode(
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
             qo_indptr_host,
-            indptr_cpu,
-            seq_lens_cpu,
-            batch_size,  # total_num_rows
             batch_size,
             num_qo_heads,
             num_kv_heads,
             page_size,
             self.is_cuda_graph_enabled,
-            head_dim,
-            head_dim,
-            False,  # causal
             window_left,
+            logits_soft_cap,
+            head_dim,
+            head_dim,
+            torch.empty(0, dtype=q_data_type),
+            torch.empty(0, dtype=kv_data_type),
         ]
         if self._backend == "fa2":
             args.append(fixed_split_size)

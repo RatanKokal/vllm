@@ -11,6 +11,7 @@ from vllm.distributed import (
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 
 
 # --8<-- [start:logits_processor]
@@ -91,8 +92,14 @@ class LogitsProcessor(CustomOp):
         lm_head: VocabParallelEmbedding,
         embedding_bias: torch.Tensor | None,
     ) -> torch.Tensor | None:
-        # Get the logits for the next tokens.
-        logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+        
+        # Check if we are using our injected quantized linear layer
+        if isinstance(lm_head, ColumnParallelLinear):
+            # ColumnParallelLinear returns (output, bias), so we unpack the tuple
+            logits, _ = lm_head(hidden_states)
+        else:
+            # Fallback for standard unquantized ParallelLMHead
+            logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
 
         # Gather logits for TP
         logits = self._gather_logits(logits)

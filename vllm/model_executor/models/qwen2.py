@@ -46,6 +46,7 @@ from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
+    ColumnParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -546,11 +547,16 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsEagle3):
 
         if get_pp_group().is_last_rank:
             if config.tie_word_embeddings:
+                # Standard unquantized Qwen2 models use tied embeddings
                 self.lm_head = self.model.embed_tokens
             else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
+                # Custom AWQ/Marlin quantized models (and untied standard models) 
+                # use ColumnParallelLinear
+                self.lm_head = ColumnParallelLinear(
+                    input_size=config.hidden_size,
+                    output_size=config.vocab_size,
+                    bias=False,
+                    gather_output=False,
                     quant_config=quant_config,
                     prefix=maybe_prefix(prefix, "lm_head"),
                 )

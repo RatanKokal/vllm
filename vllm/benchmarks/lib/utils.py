@@ -7,6 +7,11 @@ import math
 import os
 from typing import Any
 
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
+
 
 def convert_to_pytorch_benchmark_format(
     args: argparse.Namespace, metrics: dict[str, list], extra_info: dict[str, Any]
@@ -69,11 +74,45 @@ class InfEncoder(json.JSONEncoder):
         return super().iterencode(self.clear_inf(o), *args, **kwargs)
 
 
+def _clear_inf(o: Any) -> Any:
+    if isinstance(o, dict):
+        return {
+            str(k) if not isinstance(k, (str, int, float, bool, type(None))) else k:
+            _clear_inf(v)
+            for k, v in o.items()
+        }
+    if isinstance(o, list):
+        return [_clear_inf(v) for v in o]
+    if isinstance(o, float) and math.isinf(o):
+        return "inf"
+    return o
+
+
+def _json_default(o: Any) -> str:
+    return f"<{type(o).__name__} is not JSON serializable>"
+
+
+def json_loads(data: str | bytes) -> Any:
+    if _orjson is not None:
+        return _orjson.loads(data)
+    return json.loads(data)
+
+
+def json_load(fp: Any) -> Any:
+    return json_loads(fp.read())
+
+
+def json_dumps(data: Any) -> str:
+    sanitized = _clear_inf(data)
+    if _orjson is not None:
+        return _orjson.dumps(
+            sanitized,
+            default=_json_default,
+            option=_orjson.OPT_NON_STR_KEYS,
+        ).decode("utf-8")
+    return json.dumps(sanitized, cls=InfEncoder, default=_json_default)
+
+
 def write_to_json(filename: str, records: list) -> None:
     with open(filename, "w") as f:
-        json.dump(
-            records,
-            f,
-            cls=InfEncoder,
-            default=lambda o: f"<{type(o).__name__} is not JSON serializable>",
-        )
+        f.write(json_dumps(records))

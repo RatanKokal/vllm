@@ -22,7 +22,6 @@ import argparse
 import asyncio
 import contextlib
 import importlib.util
-import json
 import os
 import random
 import shutil
@@ -47,7 +46,12 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     RequestFuncOutput,
 )
 from vllm.benchmarks.lib.ready_checker import wait_for_endpoint
-from vllm.benchmarks.lib.utils import convert_to_pytorch_benchmark_format, write_to_json
+from vllm.benchmarks.lib.utils import (
+    convert_to_pytorch_benchmark_format,
+    json_dumps,
+    json_loads,
+    write_to_json,
+)
 from vllm.tokenizers import TokenizerLike, get_tokenizer
 from vllm.utils.gc_utils import freeze_gc_heap
 from vllm.utils.network_utils import join_host_port
@@ -64,11 +68,11 @@ async def get_first_model_from_server(
 ) -> tuple[str, str]:
     """Fetch the first model from the server's /v1/models endpoint."""
     models_url = f"{base_url}/v1/models"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(json_serialize=json_dumps) as session:
         try:
             async with session.get(models_url, headers=headers) as response:
                 response.raise_for_status()
-                data = await response.json()
+                data = await response.json(loads=json_loads)
                 if "data" in data and len(data["data"]) > 0:
                     return data["data"][0]["id"], data["data"][0]["root"]
                 else:
@@ -76,7 +80,7 @@ async def get_first_model_from_server(
                         f"No models found on the server at {base_url}. "
                         "Make sure the server is running and has models loaded."
                     )
-        except (aiohttp.ClientError, json.JSONDecodeError) as e:
+        except (aiohttp.ClientError, ValueError) as e:
             raise RuntimeError(
                 f"Failed to fetch models from server at {models_url}. "
                 "Check that:\n"
@@ -1498,7 +1502,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="A JSON string representing extra body parameters to include "
         "in each request."
         'Example: \'{"chat_template_kwargs":{"enable_thinking":false}}\'',
-        type=json.loads,
+        type=json_loads,
         default=None,
     )
 
@@ -1761,7 +1765,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
             # Append a newline.
             if args.append_result and outfile.tell() != 0:
                 outfile.write("\n")
-            json.dump(result_json, outfile)
+            outfile.write(json_dumps(result_json))
         save_to_pytorch_benchmark_format(args, result_json, file_name)
 
     return result_json

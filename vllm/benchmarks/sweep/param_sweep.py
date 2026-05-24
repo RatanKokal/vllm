@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import json
 import os
 from typing import Any
+
+from vllm.benchmarks.lib.utils import json_dumps, json_load
 
 
 class ParameterSweep(list["ParameterSweepItem"]):
     @classmethod
     def read_json(cls, filepath: os.PathLike):
         with open(filepath, "rb") as f:
-            data = json.load(f)
+            data = json_load(f)
 
         # Support both list and dict formats
         if isinstance(data, dict):
@@ -130,7 +131,7 @@ class ParameterSweepItem(dict[str, object]):
 
             # Serialize dict values as JSON
             if isinstance(v, dict):
-                v = json.dumps(v)
+                v = json_dumps(v)
 
             for k_candidate in self._iter_cmd_key_candidates(k):
                 try:

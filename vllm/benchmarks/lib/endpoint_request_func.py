@@ -3,7 +3,6 @@
 """The request function for API endpoints."""
 
 import io
-import json
 import os
 import sys
 import time
@@ -15,6 +14,8 @@ from typing import Any, Literal, Protocol
 import aiohttp
 import regex as re
 from tqdm.asyncio import tqdm
+
+from vllm.benchmarks.lib.utils import json_loads
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
@@ -50,10 +51,10 @@ class StreamedResponseHandler:
                 self.buffer = ""
             elif message_content:
                 try:
-                    json.loads(message_content)
+                    json_loads(message_content)
                     messages.append(self.buffer.strip())
                     self.buffer = ""
-                except json.JSONDecodeError:
+                except ValueError:
                     # Incomplete JSON, wait for more chunks.
                     pass
 
@@ -204,7 +205,7 @@ async def async_request_openai_completions(
                         chunk = message.removeprefix("data: ")
 
                         if chunk != "[DONE]":
-                            data = json.loads(chunk)
+                            data = json_loads(chunk)
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -336,7 +337,7 @@ async def async_request_openai_chat_completions(
 
                         if chunk != "[DONE]":
                             timestamp = time.perf_counter()
-                            data = json.loads(chunk)
+                            data = json_loads(chunk)
 
                             if choices := data.get("choices"):
                                 content = choices[0]["delta"].get("content")
@@ -442,7 +443,7 @@ async def async_request_openai_audio(
                             chunk = message.decode("utf-8").removeprefix("data: ")
                             if chunk != "[DONE]":
                                 timestamp = time.perf_counter()
-                                data = json.loads(chunk)
+                                data = json_loads(chunk)
 
                                 if choices := data.get("choices"):
                                     content = choices[0]["delta"].get("content")
@@ -497,10 +498,10 @@ async def _run_pooling_request(
                 output.ttft = output.latency = time.perf_counter() - st
 
                 if payload.get("encoding_format", "float") == "bytes":
-                    metadata = json.loads(response.headers["metadata"])
+                    metadata = json_loads(response.headers["metadata"])
                     usage = metadata.get("usage", {})
                 else:
-                    data = await response.json()
+                    data = await response.json(loads=json_loads)
                     usage = data.get("usage", {})
 
                 output.success = True

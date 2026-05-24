@@ -13,7 +13,7 @@ from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
 from statistics import mean
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import aiohttp  # type: ignore
 import numpy as np  # type: ignore
@@ -34,6 +34,28 @@ from transformers import AutoTokenizer  # type: ignore
 
 NUM_TOKENS_FROM_DATASET = 0
 TERM_SIGNAL = None
+
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
+
+
+def _json_loads(data: str | bytes) -> Any:
+    if _orjson is not None:
+        return _orjson.loads(data)
+    return json.loads(data)
+
+
+def _json_load(fp: Any) -> Any:
+    return _json_loads(fp.read())
+
+
+def _json_dump(data: Any, fp: Any, *, indent: int | None = None) -> None:
+    if _orjson is not None and indent is None:
+        fp.write(_orjson.dumps(data).decode("utf-8"))
+        return
+    json.dump(data, fp, indent=indent)
 
 
 class ConversationSampling(str, Enum):
@@ -275,13 +297,13 @@ async def send_request(
                     # End of stream
                     latency = time.perf_counter_ns() - start_time
                 elif stream is False:
-                    data = json.loads(chunk)
+                    data = _json_loads(chunk)
                     message = data["choices"][0]["message"]
                     assert message["role"] == "assistant"
                     generated_text += message["content"]
                 else:
                     timestamp: int = time.perf_counter_ns()
-                    data = json.loads(chunk)
+                    data = _json_loads(chunk)
 
                     # Delta is the new content/text/data
                     delta = data["choices"][0]["delta"]
@@ -583,7 +605,7 @@ async def client_main(
     # Flag that indicates that there are no new tasks (conversations) for the client
     task_queue_empty = False
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(json_serialize=_json_dump) as session:
         # Print progress
 
         while task_queue_empty is False:
@@ -1242,7 +1264,7 @@ def process_statistics(
 
 async def get_server_info(url: str) -> None:
     logger.info(f"{Color.BLUE}Collecting information from server: {url}{Color.RESET}")
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(json_serialize=_json_dump) as session:
         # Get server version (not mandatory, "version" endpoint may not exist)
         url_version = f"{url}/version"
         async with session.get(url_version) as response:
@@ -1256,7 +1278,7 @@ async def get_server_info(url: str) -> None:
             if HTTPStatus(response.status) == HTTPStatus.OK:
                 text = await response.text()
                 logger.info(f"{Color.BLUE}Models:{Color.RESET}")
-                models_data = json.loads(text)
+                models_data = _json_loads(text)
                 models_list = models_data["data"]
                 for model in models_list:
                     model_id = model["id"]
@@ -1511,7 +1533,7 @@ async def main() -> None:
     # Load the input file (either conversations of configuration file)
     logger.info(f"Reading input file: {args.input_file}")
     with open(args.input_file) as f:
-        input_data = json.load(f)
+        input_data = _json_load(f)
 
     gen_conv_args = None
     if isinstance(input_data, list):
@@ -1659,7 +1681,7 @@ async def main() -> None:
             f"{Color.GREEN}Writing conversations file: {args.output_file}{Color.RESET}"
         )
         with open(args.output_file, "w") as f:
-            json.dump(output_data, f, indent=4)
+            _json_dump(output_data, f, indent=4)
 
 
 if __name__ == "__main__":

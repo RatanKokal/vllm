@@ -16,7 +16,6 @@ import argparse
 import ast
 import base64
 import io
-import json
 import logging
 import math
 import random
@@ -39,6 +38,7 @@ from vllm.lora.utils import get_adapter_absolute_path
 from vllm.multimodal import MultiModalDataDict
 from vllm.multimodal.image import convert_image_mode
 from vllm.tokenizers import TokenizerLike
+from vllm.benchmarks.lib.utils import json_load, json_loads
 from vllm.utils.import_utils import PlaceholderModule
 
 try:
@@ -1223,7 +1223,7 @@ class ShareGPTDataset(BenchmarkDataset):
             raise ValueError("dataset_path must be provided for loading data.")
 
         with open(self.dataset_path, encoding="utf-8") as f:
-            self.data = json.load(f)
+            self.data = json_load(f)
         # Filter entries with at least two conversation turns.
         self.data = [
             entry
@@ -1605,7 +1605,7 @@ def add_random_multimodal_dataset_args(
     )
     parser_or_group.add_argument(
         "--random-mm-limit-mm-per-prompt",
-        type=json.loads,
+        type=json_loads,
         default=RandomMultiModalDataset.DEFAULT_LIMIT_MM_PER_PROMPT,
         help=(
             "Per-modality hard caps for items attached per request, e.g. "

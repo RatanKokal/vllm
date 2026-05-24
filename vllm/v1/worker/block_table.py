@@ -114,6 +114,10 @@ class BlockTable:
         start = self.num_blocks_per_row[row_idx]
         self.num_blocks_per_row[row_idx] += num_blocks
         self.block_table.np[row_idx, start : start + num_blocks] = block_ids
+        self.block_table.gpu[row_idx, start : start + num_blocks].copy_(
+            torch.from_numpy(np.asarray(block_ids, dtype=np.int32)),
+            non_blocking=True,
+        )
 
     def add_row(self, block_ids: list[int], row_idx: int) -> None:
         self.num_blocks_per_row[row_idx] = 0
@@ -129,6 +133,9 @@ class BlockTable:
         src_tgt, tgt_src = [src, tgt], [tgt, src]
         self.num_blocks_per_row[src_tgt] = self.num_blocks_per_row[tgt_src]
         self.block_table.np[src_tgt] = self.block_table.np[tgt_src]
+        tmp = self.block_table.gpu[src].clone()
+        self.block_table.gpu[src].copy_(self.block_table.gpu[tgt])
+        self.block_table.gpu[tgt].copy_(tmp)
 
     def compute_slot_mapping(
         self, req_indices: np.ndarray, positions: np.ndarray

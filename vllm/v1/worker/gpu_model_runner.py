@@ -407,6 +407,10 @@ class GPUModelRunner(
 
         # Async scheduling
         self.use_async_scheduling = self.scheduler_config.async_scheduling
+        # Multi-step scheduling: when True, sample_tokens() keeps
+        # prev_sampled_token_ids on the GPU so the next execute_model()
+        # can feed it directly into input_ids without a D->H sync.
+        self._multi_step_keep_prev_tokens: bool = False
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -2879,7 +2883,8 @@ class GPUModelRunner(
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
-        invalid_req_indices = []
+        invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
+        invalid_req_indices_set = set(invalid_req_indices)
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -2903,14 +2908,15 @@ class GPUModelRunner(
                 )
         else:
             valid_sampled_token_ids = []
-            invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
-            invalid_req_indices_set = set(invalid_req_indices)
 
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             # With spec decoding, this is done in propose_draft_token_ids().
-            if self.input_batch.prev_sampled_token_ids is None:
+            if (
+                self.input_batch.prev_sampled_token_ids is None
+                or self._multi_step_keep_prev_tokens
+            ):
                 assert sampled_token_ids.shape[-1] == 1
                 self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_req_id_to_index = {
@@ -2951,6 +2957,13 @@ class GPUModelRunner(
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+
+        if self._multi_step_keep_prev_tokens:
+            for req_idx, req_id in enumerate(req_ids):
+                if req_idx in invalid_req_indices_set:
+                    continue
+                self.input_batch.num_computed_tokens_cpu[req_idx] += 1
+                self.requests[req_id].num_computed_tokens += 1
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
@@ -3266,6 +3279,10 @@ class GPUModelRunner(
             return slot_mappings_by_gid, result
 
         return slot_mappings_by_gid, slot_mappings_by_layer
+
+    def set_multi_step_keep_prev_tokens(self, value: bool) -> None:
+        """Called by EngineCore multi-step loop to control token retention."""
+        self._multi_step_keep_prev_tokens = value
 
     @torch.inference_mode()
     def execute_model(
@@ -3628,7 +3645,10 @@ class GPUModelRunner(
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
-        self.input_batch.prev_sampled_token_ids = None
+        # Multi-step: retain the GPU-resident sampled tokens so the next
+        # execute_model() step can use them directly as input_ids.
+        if not self._multi_step_keep_prev_tokens:
+            self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None

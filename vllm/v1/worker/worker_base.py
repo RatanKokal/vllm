@@ -110,6 +110,14 @@ class WorkerBase:
         if callable(reset_fn):
             reset_fn()
 
+    def set_multi_step_keep_prev_tokens(self, value: bool) -> None:
+        """Forward multi-step token retention toggle to the model runner."""
+        if self.model_runner is None:
+            return
+        setter = getattr(self.model_runner, "set_multi_step_keep_prev_tokens", None)
+        if callable(setter):
+            setter(value)
+
     def get_model(self) -> nn.Module:
         raise NotImplementedError
 

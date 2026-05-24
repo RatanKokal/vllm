@@ -206,6 +206,9 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+        # Multi-step scheduling: N decode steps per scheduler call.
+        _ms = int(os.environ.get("VLLM_NUM_SCHEDULER_STEPS", "1"))
+        self.num_scheduler_steps: int = max(1, _ms)
 
         self.aborts_queue = queue.Queue[list[str]]()
         # Mark the startup heap as static so that it's ignored by GC.
@@ -369,33 +372,132 @@ class EngineCore:
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
-        Returns tuple of outputs and a flag indicating whether the model
-        was executed.
+        With VLLM_NUM_SCHEDULER_STEPS=N (N > 1) and a pure-decode batch,
+        runs N GPU forward passes before a single D->H sync + scheduler
+        update, amortising the cudaEventSynchronize overhead identified
+        by nsys profiling (~54 %% of traced wall time on T4).
         """
-
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.log_error_detail(scheduler_output),
-            self.log_iteration_details(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
 
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
+        scheduler_output = self.scheduler.schedule()
+        model_executed = scheduler_output.total_num_scheduled_tokens > 0
+
+        # Multi-step only applies to pure-decode batches (every request
+        # contributes exactly 1 new token - no prefill, no spec tokens).
+        _precomputed_tokens: dict[str, int] = {
+            req_id: num
+            for req_id, num in zip(
+                scheduler_output.scheduled_cached_reqs.req_ids,
+                scheduler_output.scheduled_cached_reqs.num_computed_tokens,
+            )
+        }
+        for new_req in scheduler_output.scheduled_new_reqs:
+            _precomputed_tokens[new_req.req_id] = new_req.num_computed_tokens
+
+        def _is_decode_req(req_id: str) -> bool:
+            req = self.scheduler.requests.get(req_id)
+            if req is None:
+                return False
+            num_pre = _precomputed_tokens.get(req_id)
+            if num_pre is None:
+                return False
+            return num_pre >= req.num_prompt_tokens
+
+        _has_structured_output = any(
+            (req := self.scheduler.requests.get(req_id)) and req.use_structured_output
+            for req_id in scheduler_output.num_scheduled_tokens
+        )
+        _pure_decode = (
+            model_executed
+            and not self.async_scheduling
+            and not scheduler_output.scheduled_spec_decode_tokens
+            and not scheduler_output.scheduled_encoder_inputs
+            and not _has_structured_output
+            and all(
+                n == 1 for n in scheduler_output.num_scheduled_tokens.values()
+            )
+            and all(
+                _is_decode_req(req_id)
+                for req_id in scheduler_output.num_scheduled_tokens
+            )
+        )
+        _n_steps = self.num_scheduler_steps if _pure_decode else 1
+
+        if _n_steps == 1:
+            # -- Normal single-step path (unchanged) --
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.log_error_detail(scheduler_output),
+                self.log_iteration_details(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+
+            self._process_aborts_queue()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            return engine_core_outputs, model_executed
+
+        # -- Multi-step: blind GPU execution, no CPU sync between steps --
+        # The model runner feeds prev_sampled_token_ids (GPU tensor) directly
+        # into input_ids via _prepare_inputs(), avoiding any D->H transfer.
+        # We tell the runner to keep prev_sampled_token_ids alive across calls.
+        self.model_executor.collective_rpc(
+            "set_multi_step_keep_prev_tokens", args=(True,)
+        )
+        try:
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.log_error_detail(scheduler_output),
+                self.log_iteration_details(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+
+            per_step_outputs = [model_output]
+            for _step in range(1, _n_steps):
+                _fut = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                with self.log_error_detail(scheduler_output):
+                    _out = _fut.result()
+                    if _out is None:
+                        _out = self.model_executor.sample_tokens(grammar_output)
+                per_step_outputs.append(_out)
+        finally:
+            # Always restore, even if a step raises.
+            self.model_executor.collective_rpc(
+                "set_multi_step_keep_prev_tokens", args=(False,)
+            )
+
+        # Build combined ModelRunnerOutput.
+        # sampled_token_ids shape: [req_idx][step_idx] = list[int]
+        # scheduler.update_from_output() detects this nested shape and
+        # iterates over every step's tokens before stopping.
+        _final = per_step_outputs[-1]
+        _n_reqs = len(_final.req_ids)
+        combined_sampled: list = [
+            [per_step_outputs[s].sampled_token_ids[r] for s in range(_n_steps)]
+            for r in range(_n_reqs)
+        ]
+        from dataclasses import replace as _dc_replace
+        final_output = _dc_replace(_final, sampled_token_ids=combined_sampled)
+
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+            scheduler_output, final_output
         )
-
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+        return engine_core_outputs, model_executed
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -426,6 +528,13 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        def _futures_done(
+            futures: Future[ModelRunnerOutput] | list[Future[ModelRunnerOutput]],
+        ) -> bool:
+            if isinstance(futures, list):
+                return all(f.done() for f in futures)
+            return futures.done()
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -435,41 +544,141 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
-            exec_future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
             if not self.is_ec_producer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
+            _n_steps = 1
+            if (
+                model_executed
+                and self.num_scheduler_steps > 1
+                and not self.is_pooling_model
+            ):
+                _precomputed_tokens: dict[str, int] = {
+                    req_id: num
+                    for req_id, num in zip(
+                        scheduler_output.scheduled_cached_reqs.req_ids,
+                        scheduler_output.scheduled_cached_reqs.num_computed_tokens,
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
+                }
+                for new_req in scheduler_output.scheduled_new_reqs:
+                    _precomputed_tokens[new_req.req_id] = new_req.num_computed_tokens
 
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                def _is_decode_req(req_id: str) -> bool:
+                    req = self.scheduler.requests.get(req_id)
+                    if req is None:
+                        return False
+                    num_pre = _precomputed_tokens.get(req_id)
+                    if num_pre is None:
+                        return False
+                    return num_pre >= req.num_prompt_tokens
+
+                _has_structured_output = any(
+                    (req := self.scheduler.requests.get(req_id))
+                    and req.use_structured_output
+                    for req_id in scheduler_output.num_scheduled_tokens
+                )
+                _pure_decode = (
+                    not scheduler_output.scheduled_spec_decode_tokens
+                    and not scheduler_output.scheduled_encoder_inputs
+                    and not scheduler_output.pending_structured_output_tokens
+                    and not _has_structured_output
+                    and all(
+                        n == 1
+                        for n in scheduler_output.num_scheduled_tokens.values()
+                    )
+                    and all(
+                        _is_decode_req(req_id)
+                        for req_id in scheduler_output.num_scheduled_tokens
+                    )
+                )
+                if _pure_decode:
+                    _n_steps = self.num_scheduler_steps
+                    _extra = _n_steps - 1
+                    if _extra > 0:
+                        for req_id in scheduler_output.num_scheduled_tokens:
+                            req = self.scheduler.requests.get(req_id)
+                            if req is not None:
+                                req.num_output_placeholders += _extra
+                        if scheduler_output.scheduled_cached_reqs.num_output_tokens:
+                            idx_map = {
+                                req_id: i
+                                for i, req_id in enumerate(
+                                    scheduler_output.scheduled_cached_reqs.req_ids
+                                )
+                            }
+                            for req_id in scheduler_output.num_scheduled_tokens:
+                                idx = idx_map.get(req_id)
+                                if idx is not None:
+                                    scheduler_output.scheduled_cached_reqs.num_output_tokens[
+                                        idx
+                                    ] += _extra
+
+            if _n_steps > 1:
+                # Multi-step: keep sampled tokens on GPU across steps.
+                self.model_executor.collective_rpc(
+                    "set_multi_step_keep_prev_tokens", args=(True,)
+                )
+                step_futures: list[Future[ModelRunnerOutput]] = []
+                step_exec_futures: list[Future[Any]] = []
+                try:
+                    grammar_output = None
+                    for _step in range(_n_steps):
+                        _exec_future = self.model_executor.execute_model(
+                            scheduler_output, non_block=True
+                        )
+                        _future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                        step_exec_futures.append(cast(Future[Any], _exec_future))
+                        step_futures.append(cast(Future[ModelRunnerOutput], _future))
+                finally:
+                    self.model_executor.collective_rpc(
+                        "set_multi_step_keep_prev_tokens", args=(False,)
+                    )
+
+                batch_queue.appendleft(
+                    (step_futures, scheduler_output, step_exec_futures)
+                )
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
-                    and not batch_queue[-1][0].done()
+                    and not _futures_done(batch_queue[-1][0])
                 ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
                     return None, True
+            else:
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+
+                if self.is_pooling_model or not model_executed:
+                    # No sampling required (no requests scheduled).
+                    future = cast(Future[ModelRunnerOutput], exec_future)
+                else:
+                    if not scheduler_output.pending_structured_output_tokens:
+                        # We aren't waiting for any tokens, get any grammar output
+                        # and sample immediately.
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        # We need to defer sampling until we have processed the model output
+                        # from the prior step.
+                        deferred_scheduler_output = scheduler_output
+
+                if not deferred_scheduler_output:
+                    # Add this step's future to the queue.
+                    batch_queue.appendleft((future, scheduler_output, exec_future))
+                    if (
+                        model_executed
+                        and len(batch_queue) < self.batch_queue_size
+                        and not _futures_done(batch_queue[-1][0])
+                    ):
+                        # Don't block on next worker response unless the queue is full
+                        # or there are no more requests to schedule.
+                        return None, True
 
         elif not batch_queue:
             # Queue is empty. We should not reach here since this method should
@@ -483,12 +692,35 @@ class EngineCore:
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
-            model_output = future.result()
-            if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
+            if isinstance(future, list):
+                per_step_outputs: list[ModelRunnerOutput] = []
+                exec_futures = cast(list[Future[Any]], exec_model_fut)
+                for step_idx, step_future in enumerate(future):
+                    step_output = step_future.result()
+                    if step_output is None:
+                        # None from sample_tokens() implies execute_model failed.
+                        exec_futures[step_idx].result()
+                        raise RuntimeError("unexpected error")
+                    per_step_outputs.append(step_output)
+
+                _final = per_step_outputs[-1]
+                _n_reqs = len(_final.req_ids)
+                combined_sampled: list = [
+                    [
+                        per_step_outputs[s].sampled_token_ids[r]
+                        for s in range(len(per_step_outputs))
+                    ]
+                    for r in range(_n_reqs)
+                ]
+                from dataclasses import replace as _dc_replace
+                model_output = _dc_replace(_final, sampled_token_ids=combined_sampled)
+            else:
+                model_output = future.result()
+                if model_output is None:
+                    # None from sample_tokens() implies that the original execute_model()
+                    # call failed - raise that exception.
+                    exec_model_fut.result()
+                    raise RuntimeError("unexpected error")
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

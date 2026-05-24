@@ -91,6 +91,17 @@ class Scheduler(SchedulerInterface):
         import os
         self._min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
         self._min_queued_timeout_s = float(os.environ.get("VLLM_MIN_QUEUED_TIMEOUT", "0.2"))
+        # Multi-step scheduling: number of consecutive decode forward passes to
+        # run on the GPU before a single D->H sync + scheduler call.
+        # N=1 (default) reproduces existing behaviour exactly.
+        self.num_scheduler_steps: int = max(
+            1, int(os.environ.get("VLLM_NUM_SCHEDULER_STEPS", "1"))
+        )
+        if self.num_scheduler_steps > 1:
+            logger.info(
+                "Multi-step scheduling enabled: num_scheduler_steps=%d",
+                self.num_scheduler_steps,
+            )
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -430,10 +441,22 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
+                    # For pure decode steps pre-allocate (num_scheduler_steps-1)
+                    # extra KV slots so the GPU can run N steps back-to-back.
+                    # For prefill (num_new_tokens > 1) keep existing behaviour.
+                    _ms_extra_lookahead = (
+                        (self.num_scheduler_steps - 1)
+                        if num_new_tokens == 1
+                        and self.num_scheduler_steps > 1
+                        and not request.resumable
+                        else 0
+                    )
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
-                        num_lookahead_tokens=self.num_lookahead_tokens,
+                        num_lookahead_tokens=(
+                            self.num_lookahead_tokens + _ms_extra_lookahead
+                        ),
                     )
 
                     if new_blocks is not None:
@@ -1249,7 +1272,22 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        sampled_token_ids = model_runner_output.sampled_token_ids
+        # Multi-step: sampled_token_ids may be:
+        #   list[list[int]]          - normal single-step (unchanged)
+        #   list[list[list[int]]]    - multi-step; outer = req, inner = steps
+        # Normalise to steps_sampled[step_idx][req_idx] = list[int].
+        _raw = model_runner_output.sampled_token_ids
+        if _raw and _raw[0] and isinstance(_raw[0][0], list):
+            # Multi-step shape: _raw[req][step] = [token_id]
+            _num_steps = len(_raw[0])
+            steps_sampled: list[list[list[int]]] = [
+                [_raw[req_idx][step] for req_idx in range(len(_raw))]
+                for step in range(_num_steps)
+            ]
+        else:
+            # Normal single-step - wrap for uniform loop below.
+            steps_sampled = [_raw] if _raw else [[]]
+        sampled_token_ids = steps_sampled[0]
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
@@ -1338,9 +1376,24 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
-                new_token_ids, stopped = self._update_request_with_output(
-                    request, new_token_ids
-                )
+                # Multi-step: iterate every step tokens in order.
+                # _update_request_with_output checks stop after each token.
+                _all_new_toks: list[int] = []
+                for _s_idx, _step_rows in enumerate(steps_sampled):
+                    _tok = _step_rows[req_index] if _step_rows else []
+                    if not _tok:
+                        break
+                    _tok, stopped = self._update_request_with_output(
+                        request, _tok
+                    )
+                    _all_new_toks.extend(_tok)
+                    if stopped:
+                        break
+                new_token_ids = _all_new_toks
+                if len(steps_sampled) > 1:
+                    extra_tokens = len(new_token_ids) - num_tokens_scheduled
+                    if extra_tokens > 0:
+                        request.num_computed_tokens += extra_tokens
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import Any, Final
 
+import orjson
 import jinja2
 import partial_json_parser
 import regex as re
@@ -782,8 +783,9 @@ class OpenAIServingChat(OpenAIServing):
                                 total_tokens=num_prompt_tokens,
                             )
 
-                        data = chunk.model_dump_json(exclude_unset=True)
-                        yield f"data: {data}\n\n"
+                        chunk_dict = chunk.model_dump(exclude_unset=True)
+                        chunk_str = orjson.dumps(chunk_dict).decode("utf-8")
+                        yield f"data: {chunk_str}\n\n"
 
                     # Send response to echo the input portion of the
                     # last message
@@ -818,8 +820,9 @@ class OpenAIServingChat(OpenAIServing):
                                         total_tokens=num_prompt_tokens,
                                     )
 
-                                data = chunk.model_dump_json(exclude_unset=True)
-                                yield f"data: {data}\n\n"
+                                chunk_dict = chunk.model_dump(exclude_unset=True)
+                                chunk_str = orjson.dumps(chunk_dict).decode("utf-8")
+                                yield f"data: {chunk_str}\n\n"
                     first_iteration = False
 
                 for output in res.outputs:

@@ -7,6 +7,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import cast
 
+import orjson
 import jinja2
 from fastapi import Request
 
@@ -480,7 +481,8 @@ class OpenAIServingCompletion(OpenAIServing):
                             total_tokens=prompt_tokens + completion_tokens,
                         )
 
-                    response_json = chunk.model_dump_json(exclude_unset=False)
+                    response_dict = chunk.model_dump(exclude_unset=False)
+                    response_json = orjson.dumps(response_dict).decode("utf-8")
                     yield f"data: {response_json}\n\n"
 
             total_prompt_tokens = sum(num_prompt_tokens)
@@ -504,9 +506,10 @@ class OpenAIServingCompletion(OpenAIServing):
                     choices=[],
                     usage=final_usage_info,
                 )
-                final_usage_data = final_usage_chunk.model_dump_json(
+                final_usage_dict = final_usage_chunk.model_dump(
                     exclude_unset=False, exclude_none=True
                 )
+                final_usage_data = orjson.dumps(final_usage_dict).decode("utf-8")
                 yield f"data: {final_usage_data}\n\n"
 
             # report to FastAPI middleware aggregate usage across all choices

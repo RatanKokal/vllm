@@ -8,6 +8,7 @@ from collections.abc import Sequence as GenericSequence
 from typing import cast
 
 import jinja2
+import json
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -354,6 +355,12 @@ class OpenAIServingCompletion(OpenAIServing):
             stream_options, self.enable_force_include_usage
         )
 
+        # Pre-build one chunk object per choice slot and reuse across tokens.
+        # OpenAIBaseModel has no validate_assignment so __setattr__ is a free
+        # dict write. Avoids ~2 Pydantic __init__ calls per token per request.
+        _cached_choices: dict[int, CompletionResponseStreamChoice] = {}
+        _cached_chunks: dict[int, CompletionStreamResponse] = {}
+
         try:
             async for prompt_idx, res in result_generator:
                 prompt_token_ids = res.prompt_token_ids
@@ -451,26 +458,44 @@ class OpenAIServingCompletion(OpenAIServing):
 
                     self._raise_if_error(finish_reason, request_id)
 
-                    chunk = CompletionStreamResponse(
-                        id=request_id,
-                        created=created_time,
-                        model=model_name,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=i,
-                                text=delta_text,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason,
-                                stop_reason=stop_reason,
-                                prompt_token_ids=prompt_token_ids_to_return,
-                                token_ids=(
-                                    as_list(output.token_ids)
-                                    if request.return_token_ids
-                                    else None
-                                ),
-                            )
-                        ],
-                    )
+                    # Fast path: reuse pre-built objects, mutate only what changes.
+                    # Constant per request: index, id, created, model.
+                    # Changes per token: text, finish_reason, stop_reason.
+                    if i not in _cached_choices:
+                        _cached_choices[i] = CompletionResponseStreamChoice(
+                            index=i,
+                            text=delta_text,
+                            logprobs=logprobs,
+                            finish_reason=finish_reason,
+                            stop_reason=stop_reason,
+                            prompt_token_ids=prompt_token_ids_to_return,
+                            token_ids=(
+                                as_list(output.token_ids)
+                                if request.return_token_ids
+                                else None
+                            ),
+                        )
+                        _cached_chunks[i] = CompletionStreamResponse(
+                            id=request_id,
+                            created=created_time,
+                            model=model_name,
+                            choices=[_cached_choices[i]],
+                        )
+                    else:
+                        _choice = _cached_choices[i]
+                        _choice.text = delta_text
+                        _choice.finish_reason = finish_reason
+                        _choice.stop_reason = stop_reason
+                        if logprobs is not None or _choice.logprobs is not None:
+                            _choice.logprobs = logprobs
+                        if prompt_token_ids_to_return is not None:
+                            _choice.prompt_token_ids = prompt_token_ids_to_return
+                        else:
+                            _choice.prompt_token_ids = None  # reset after first token
+                        if request.return_token_ids:
+                            _choice.token_ids = as_list(output.token_ids)
+
+                    chunk = _cached_chunks[i]
                     if include_continuous_usage:
                         prompt_tokens = num_prompt_tokens[prompt_idx]
                         completion_tokens = previous_num_tokens[i]
@@ -479,8 +504,45 @@ class OpenAIServingCompletion(OpenAIServing):
                             completion_tokens=completion_tokens,
                             total_tokens=prompt_tokens + completion_tokens,
                         )
+                    else:
+                        chunk.usage = None
 
-                    response_json = chunk.model_dump_json(exclude_unset=False)
+                    # Ultra-fast raw serialization bypass (Bypasses Pydantic traversal completely)
+                    # Maps directly to completion protocol requirements
+                    if not include_continuous_usage:
+                        response_json = (
+                            f'{{"id":"{request_id}",'
+                            f'"object":"text_completion",'
+                            f'"created":{created_time},'
+                            f'"model":"{model_name}",'
+                            f'"choices":[{{"index":{i},'
+                            f'"text":{json.dumps(delta_text)},'
+                            f'"logprobs":null,'  # Match protocol format explicitly
+                            f'"finish_reason":{json.dumps(finish_reason) if finish_reason else "null"},'
+                            f'"stop_reason":{json.dumps(stop_reason) if stop_reason else "null"}}}],'
+                            f'"usage":null}}'
+                        )
+                    else:
+                        # Only compile usage telemetry stats when strictly enabled
+                        prompt_tokens = num_prompt_tokens[prompt_idx]
+                        completion_tokens = previous_num_tokens[i]
+                        total_tokens = prompt_tokens + completion_tokens
+                        
+                        response_json = (
+                            f'{{"id":"{request_id}",'
+                            f'"object":"text_completion",'
+                            f'"created":{created_time},'
+                            f'"model":"{model_name}",'
+                            f'"choices":[{{"index":{i},'
+                            f'"text":{json.dumps(delta_text)},'
+                            f'"logprobs":null,'
+                            f'"finish_reason":{json.dumps(finish_reason) if finish_reason else "null"},'
+                            f'"stop_reason":{json.dumps(stop_reason) if stop_reason else "null"}}}],'
+                            f'"usage":{{"prompt_tokens":{prompt_tokens},'
+                            f'"completion_tokens":{completion_tokens},'
+                            f'"total_tokens":{total_tokens}}}}}'
+                        )
+
                     yield f"data: {response_json}\n\n"
 
             total_prompt_tokens = sum(num_prompt_tokens)

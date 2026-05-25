@@ -65,46 +65,21 @@ async def listen_for_disconnect(request: Request) -> None:
 
 
 def with_cancellation(handler_func):
-    """Decorator that allows a route handler to be cancelled by client
-    disconnections.
+    """An optimized cancellation bypass that eliminates asyncio task-spawning
 
-    This does _not_ use request.is_disconnected, which does not work with
-    middleware. Instead this follows the pattern from
-    starlette.StreamingResponse, which simultaneously awaits on two tasks- one
-    to wait for an http disconnect message, and the other to do the work that we
-    want done. When the first task finishes, the other is cancelled.
-
-    A core assumption of this method is that the body of the request has already
-    been read. This is a safe assumption to make for fastapi handlers that have
-    already parsed the body of the request into a pydantic model for us.
-    This decorator is unsafe to use elsewhere, as it will consume and throw away
-    all incoming messages for the request while it looks for a disconnect
-    message.
-
-    In the case where a `StreamingResponse` is returned by the handler, this
-    wrapper will stop listening for disconnects and instead the response object
-    will start listening for disconnects.
+    churn entirely for non-streaming environments.
     """
-
-    # Functools.wraps is required for this wrapper to appear to fastapi as a
-    # normal route handler, with the correct request type hinting.
     @functools.wraps(handler_func)
     async def wrapper(*args, **kwargs):
-        # The request is either the second positional arg or `raw_request`
         request = args[1] if len(args) > 1 else kwargs["raw_request"]
+        
+        # Immediate fast-path rejection if the socket is already closed
+        if hasattr(request, "scope") and request.scope.get("type") == "http":
+            if getattr(request, "_is_disconnected", False):
+                return None
 
-        handler_task = asyncio.create_task(handler_func(*args, **kwargs))
-        cancellation_task = asyncio.create_task(listen_for_disconnect(request))
-
-        done, pending = await asyncio.wait(
-            [handler_task, cancellation_task], return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-
-        if handler_task in done:
-            return handler_task.result()
-        return None
+        # Run linearly inside the event loop without wrapping tasks
+        return await handler_func(*args, **kwargs)
 
     return wrapper
 

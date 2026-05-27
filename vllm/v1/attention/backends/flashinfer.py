@@ -1296,7 +1296,7 @@ class FlashInferImpl(AttentionImpl):
         # Whenever making a change in this method, please benchmark the
         # performance to make sure it does not introduce any overhead.
 
-        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_actual_tokens = attn_metadata.slot_mapping.shape[0]
 
         if self.kv_sharing_target_layer_name is None:
             # Reshape the input keys and values and store them in the cache.

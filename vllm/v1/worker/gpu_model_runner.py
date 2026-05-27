@@ -580,14 +580,16 @@ class GPUModelRunner(
                 if self.pin_memory
                 else None
             )
-            self.ms_input_ids = self._make_buffer(
-                max_capture_tokens, dtype=torch.int32
+            self.ms_input_ids = torch.zeros(
+                max_capture_tokens, dtype=torch.int32, device=self.device
             )
-            self.ms_positions = self._make_buffer(
-                max_capture_tokens, dtype=torch.int64
+            self.ms_positions = torch.zeros(
+                max_capture_tokens, dtype=torch.int64, device=self.device
             )
-            self.ms_output = self._make_buffer(
-                max_capture_tokens, envs.VLLM_MULTI_STEP_DECODE_N, dtype=torch.int64
+            self.ms_output = torch.zeros(
+                (max_capture_tokens, envs.VLLM_MULTI_STEP_DECODE_N),
+                dtype=torch.int64,
+                device=self.device,
             )
             self.ms_logit_idx = torch.arange(
                 max_capture_tokens, dtype=torch.int64, device=self.device
@@ -697,12 +699,6 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
-
-        self.ms_input_ids: torch.Tensor | None = None
-        self.ms_positions: torch.Tensor | None = None
-        self.ms_output: torch.Tensor | None = None
-        self.ms_logit_idx: torch.Tensor | None = None
-        self.ms_slot_2d_pinned: torch.Tensor | None = None
 
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
@@ -3522,6 +3518,19 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
+            is_multistep_seq_lens_expanded = (
+                scheduler_output.num_steps > 1
+                and batch_desc.uniform
+                and not self.uses_mrope
+                and self.uses_xdrope_dim == 0
+                and not scheduler_output.scheduled_encoder_inputs
+                and not self.input_batch.req_prompt_embeds
+            )
+            if is_multistep_seq_lens_expanded:
+                self.seq_lens.np[:num_reqs] += scheduler_output.num_steps - 1
+                self.seq_lens.np[num_reqs:].fill(0)
+                self.seq_lens.copy_to_gpu()
+
             slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
                 num_tokens_padded=num_tokens_padded
                 if pad_attn or has_separate_kv_update
@@ -3559,6 +3568,40 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+
+            if is_multistep_seq_lens_expanded:
+                seq_lens_current_np = (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs] + 1
+                ).astype(np.int32)
+                block_size = self.cache_config.block_size
+                current_last_page_len_np = seq_lens_current_np % block_size
+                current_last_page_len_np = np.where(
+                    (current_last_page_len_np == 0) & (seq_lens_current_np != 0),
+                    block_size,
+                    current_last_page_len_np,
+                ).astype(np.int32)
+                current_indptr_np = np.empty(num_reqs + 1, dtype=np.int32)
+                current_indptr_np[0] = 0
+                np.cumsum(
+                    (seq_lens_current_np + block_size - 1) // block_size,
+                    dtype=np.int32,
+                    out=current_indptr_np[1:],
+                )
+
+                for attn_group in self.attn_groups:
+                    for group in attn_group:
+                        for builder in group.metadata_builders:
+                            if hasattr(builder, "paged_kv_last_page_len") and hasattr(
+                                builder, "paged_kv_indptr"
+                            ):
+                                builder.paged_kv_last_page_len.np[:num_reqs] = (
+                                    current_last_page_len_np
+                                )
+                                builder.paged_kv_last_page_len.copy_to_gpu(num_reqs)
+                                builder.paged_kv_indptr.np[: num_reqs + 1] = (
+                                    current_indptr_np
+                                )
+                                builder.paged_kv_indptr.copy_to_gpu(num_reqs + 1)
 
             is_multistep_exec = (
                 scheduler_output.num_steps > 1
@@ -3739,15 +3782,10 @@ class GPUModelRunner(
         if multi_step_token_ids is not None:
             torch.cuda.synchronize()
             valid_sampled_token_ids = multi_step_token_ids.tolist()
-            n_steps = len(valid_sampled_token_ids[0]) if valid_sampled_token_ids else 0
-            if n_steps > 0:
-                self.input_batch.num_computed_tokens_cpu[: len(valid_sampled_token_ids)] += n_steps
-                for req_idx, req_id in enumerate(self.input_batch.req_ids):
-                    self.requests[req_id].num_computed_tokens += n_steps
-                self.input_batch.prev_sampled_token_ids = multi_step_token_ids[:, -1:]
-                self.input_batch.prev_req_id_to_index = (
-                    self.input_batch.req_id_to_index.copy()
-                )
+            self.input_batch.prev_sampled_token_ids = multi_step_token_ids[:, -1:]
+            self.input_batch.prev_req_id_to_index = (
+                self.input_batch.req_id_to_index.copy()
+            )
 
             return ModelRunnerOutput(
                 req_ids=self.input_batch.req_ids.copy(),
@@ -4735,6 +4773,19 @@ class GPUModelRunner(
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
+        multistep_seq_lens_restore_np: np.ndarray | None = None
+        is_multistep = (
+            is_graph_capturing
+            and envs.VLLM_MULTI_STEP_DECODE_N > 1
+            and uniform_decode
+        )
+
+        if is_multistep:
+            n_steps = envs.VLLM_MULTI_STEP_DECODE_N
+            multistep_seq_lens_restore_np = self.seq_lens.np[:num_reqs].copy()
+            self.seq_lens.np[:num_reqs] = multistep_seq_lens_restore_np + (n_steps - 1)
+            self.seq_lens.np[num_reqs:].fill(0)
+            self.seq_lens.copy_to_gpu()
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens,
@@ -4771,10 +4822,40 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings_by_group,
             )
 
+        if multistep_seq_lens_restore_np is not None:
+            self.seq_lens.np[:num_reqs] = multistep_seq_lens_restore_np
+            self.seq_lens.np[num_reqs:].fill(0)
+            self.seq_lens.copy_to_gpu()
+
+            current_seq_lens_np = multistep_seq_lens_restore_np.astype(np.int64)
+            current_last_page_len_np = current_seq_lens_np % self.page_size
+            current_last_page_len_np = np.where(
+                (current_last_page_len_np == 0) & (current_seq_lens_np != 0),
+                self.page_size,
+                current_last_page_len_np,
+            ).astype(np.int32)
+            current_indptr_np = np.empty(num_reqs + 1, dtype=np.int32)
+            current_indptr_np[0] = 0
+            np.cumsum(
+                (current_seq_lens_np + (self.page_size - 1)) // self.page_size,
+                dtype=np.int32,
+                out=current_indptr_np[1:],
+            )
+
+            for attn_group in self.attn_groups:
+                for group in attn_group:
+                    for builder in group.metadata_builders:
+                        if hasattr(builder, "paged_kv_last_page_len"):
+                            builder.paged_kv_last_page_len.np[:num_reqs] = (
+                                current_last_page_len_np
+                            )
+                            builder.paged_kv_last_page_len.copy_to_gpu(num_reqs)
+                        if hasattr(builder, "paged_kv_indptr"):
+                            builder.paged_kv_indptr.np[: num_reqs + 1] = current_indptr_np
+                            builder.paged_kv_indptr.copy_to_gpu(num_reqs + 1)
+
         is_multistep = (
-            is_graph_capturing
-            and envs.VLLM_MULTI_STEP_DECODE_N > 1
-            and uniform_decode
+            is_multistep
             and attn_metadata is not None
             and slot_mappings_by_group is not None
             and not self.uses_mrope
@@ -4861,6 +4942,7 @@ class GPUModelRunner(
             ):
                 if is_multistep:
                     outputs = None
+                    block_size = self.cache_config.block_size
                     for step in range(n_steps):
                         for attn_group in self.attn_groups:
                             for group in attn_group:
@@ -4870,13 +4952,27 @@ class GPUModelRunner(
                                             builder.ms_slot_2d[:num_tokens_padded, step],
                                             non_blocking=True,
                                         )
-                                    decode_wrappers = getattr(
-                                        builder, "_decode_wrappers_cudagraph", None
-                                    )
-                                    if decode_wrappers is not None:
-                                        wrapper = decode_wrappers.get(num_tokens_padded)
-                                        if wrapper is not None:
-                                            wrapper._paged_kv_last_page_len_buf.add_(1)
+                                    if hasattr(builder, "paged_kv_last_page_len") and hasattr(
+                                        builder, "paged_kv_indptr"
+                                    ):
+                                        lpl = builder.paged_kv_last_page_len.gpu[
+                                            :num_tokens_padded
+                                        ]
+                                        indptr = builder.paged_kv_indptr.gpu[
+                                            : num_tokens_padded + 1
+                                        ]
+                                        lpl.add_(1)
+                                        overflow = (lpl > block_size).to(
+                                            torch.int32
+                                        )
+                                        lpl.sub_(overflow * block_size)
+                                        indptr[1:].add_(
+                                            torch.cumsum(
+                                                overflow,
+                                                dim=0,
+                                                dtype=indptr.dtype,
+                                            )
+                                        )
 
                         outputs = self.model(
                             input_ids=cur_ids,
@@ -6095,13 +6191,13 @@ class GPUModelRunner(
             for attn_group in self.attn_groups:
                 for group in attn_group:
                     for builder in group.metadata_builders:
-                        builder.ms_slot_buf = self._make_buffer(
-                            max_capture_tokens, dtype=torch.int64
+                        builder.ms_slot_buf = torch.zeros(
+                            max_capture_tokens, dtype=torch.int64, device=self.device
                         )
-                        builder.ms_slot_2d = self._make_buffer(
-                            max_capture_tokens,
-                            envs.VLLM_MULTI_STEP_DECODE_N,
+                        builder.ms_slot_2d = torch.zeros(
+                            (max_capture_tokens, envs.VLLM_MULTI_STEP_DECODE_N),
                             dtype=torch.int64,
+                            device=self.device,
                         )
 
         # Reinitialize need to after initialize_attn_backend

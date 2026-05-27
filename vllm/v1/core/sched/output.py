@@ -238,6 +238,10 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Number of decode steps the worker should execute per graph replay.
+    # Defaulting to 1 keeps msgpack-serialized SchedulerOutput compatible.
+    num_steps: int = 1
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

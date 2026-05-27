@@ -318,6 +318,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    multi_step_token_ids: torch.Tensor | None = None
 
 
 class GPUModelRunner(
@@ -565,6 +566,32 @@ class GPUModelRunner(
         )
         self.seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        if envs.VLLM_MULTI_STEP_DECODE_N > 1:
+            max_capture_tokens = max(
+                self.compilation_config.cudagraph_capture_sizes
+            ) if self.compilation_config.cudagraph_capture_sizes else self.max_num_tokens
+            self.ms_slot_2d_pinned = (
+                torch.zeros(
+                    (max_capture_tokens, envs.VLLM_MULTI_STEP_DECODE_N),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=True,
+                )
+                if self.pin_memory
+                else None
+            )
+            self.ms_input_ids = self._make_buffer(
+                max_capture_tokens, dtype=torch.int32
+            )
+            self.ms_positions = self._make_buffer(
+                max_capture_tokens, dtype=torch.int64
+            )
+            self.ms_output = self._make_buffer(
+                max_capture_tokens, envs.VLLM_MULTI_STEP_DECODE_N, dtype=torch.int64
+            )
+            self.ms_logit_idx = torch.arange(
+                max_capture_tokens, dtype=torch.int64, device=self.device
+            )
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens = self._make_buffer(
                 self.max_num_reqs, dtype=torch.int32
@@ -670,6 +697,12 @@ class GPUModelRunner(
             device="cpu",
             pin_memory=self.pin_memory,
         )
+
+        self.ms_input_ids: torch.Tensor | None = None
+        self.ms_positions: torch.Tensor | None = None
+        self.ms_output: torch.Tensor | None = None
+        self.ms_logit_idx: torch.Tensor | None = None
+        self.ms_slot_2d_pinned: torch.Tensor | None = None
 
         # Pre-allocated tensor for copying valid sampled token counts to CPU,
         # with dedicated stream for overlapping and event for coordination.
@@ -3280,6 +3313,54 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    def _prepare_multistep_decode_buffers(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        num_reqs: int,
+        num_tokens_padded: int,
+        slot_mappings_by_group: dict[int, torch.Tensor],
+        num_steps: int,
+    ) -> None:
+        assert self.ms_input_ids is not None
+        assert self.ms_positions is not None
+        assert self.ms_output is not None
+        assert self.ms_logit_idx is not None
+
+        cur_ids = self.ms_input_ids[:num_tokens_padded]
+        cur_pos = self.ms_positions[:num_tokens_padded]
+        cur_ids.copy_(input_ids[:num_tokens_padded], non_blocking=True)
+        cur_pos.copy_(positions[:num_tokens_padded], non_blocking=True)
+
+        for group_id, attn_group in enumerate(self.attn_groups):
+            if group_id not in slot_mappings_by_group:
+                continue
+            slot_2d_np = self.input_batch.block_table[
+                group_id
+            ].get_multistep_slot_mapping_np(
+                num_reqs,
+                self.input_batch.num_computed_tokens_cpu,
+                num_steps,
+            )
+            if self.ms_slot_2d_pinned is not None:
+                slot_2d = self.ms_slot_2d_pinned[:num_reqs]
+                slot_2d.numpy()[:] = slot_2d_np
+            else:
+                slot_2d = torch.from_numpy(slot_2d_np).to(
+                    self.device, non_blocking=True
+                )
+            for group in attn_group:
+                for builder in group.metadata_builders:
+                    if builder.ms_slot_buf is not None:
+                        builder.ms_slot_buf[:num_reqs].copy_(
+                            slot_2d[:num_reqs, 0], non_blocking=True
+                        )
+                    if builder.ms_slot_2d is not None:
+                        builder.ms_slot_2d[:num_reqs].copy_(
+                            slot_2d[:num_reqs], non_blocking=True
+                        )
+
     def set_multi_step_keep_prev_tokens(self, value: bool) -> None:
         """Called by EngineCore multi-step loop to control token retention."""
         self._multi_step_keep_prev_tokens = value
@@ -3479,6 +3560,27 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+            is_multistep_exec = (
+                scheduler_output.num_steps > 1
+                and batch_desc.uniform
+                and input_ids is not None
+                and inputs_embeds is None
+                and not self.uses_mrope
+                and self.uses_xdrope_dim == 0
+                and slot_mappings_by_group is not None
+            )
+            if is_multistep_exec:
+                self._prepare_multistep_decode_buffers(
+                    input_ids=input_ids,
+                    positions=positions,
+                    num_reqs=num_reqs,
+                    num_tokens_padded=num_tokens_padded,
+                    slot_mappings_by_group=slot_mappings_by_group,
+                    num_steps=scheduler_output.num_steps,
+                )
+                input_ids = self.ms_input_ids[:num_tokens_padded]
+                positions = self.ms_positions[:num_tokens_padded]
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -3589,6 +3691,9 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            self.ms_output[:num_reqs, : scheduler_output.num_steps].clone()
+            if is_multistep_exec and self.ms_output is not None
+            else None,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3626,11 +3731,35 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            multi_step_token_ids,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
+        if multi_step_token_ids is not None:
+            torch.cuda.synchronize()
+            valid_sampled_token_ids = multi_step_token_ids.tolist()
+            n_steps = len(valid_sampled_token_ids[0]) if valid_sampled_token_ids else 0
+            if n_steps > 0:
+                self.input_batch.num_computed_tokens_cpu[: len(valid_sampled_token_ids)] += n_steps
+                for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                    self.requests[req_id].num_computed_tokens += n_steps
+                self.input_batch.prev_sampled_token_ids = multi_step_token_ids[:, -1:]
+                self.input_batch.prev_req_id_to_index = (
+                    self.input_batch.req_id_to_index.copy()
+                )
+
+            return ModelRunnerOutput(
+                req_ids=self.input_batch.req_ids.copy(),
+                req_id_to_index=self.input_batch.req_id_to_index.copy(),
+                sampled_token_ids=valid_sampled_token_ids,
+                logprobs=None,
+                prompt_logprobs_dict={},
+                kv_connector_output=None,
+                ec_connector_output=None,
+                num_nans_in_logits={},
+                cudagraph_stats=None,
+            )
         if grammar_output is not None:
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
@@ -4642,6 +4771,25 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings_by_group,
             )
 
+        is_multistep = (
+            is_graph_capturing
+            and envs.VLLM_MULTI_STEP_DECODE_N > 1
+            and uniform_decode
+            and attn_metadata is not None
+            and slot_mappings_by_group is not None
+            and not self.uses_mrope
+            and self.uses_xdrope_dim == 0
+        )
+        if is_multistep:
+            n_steps = envs.VLLM_MULTI_STEP_DECODE_N
+            assert self.ms_input_ids is not None
+            assert self.ms_positions is not None
+            assert self.ms_output is not None
+            assert self.ms_logit_idx is not None
+
+            cur_ids = self.ms_input_ids[:num_tokens_padded]
+            cur_pos = self.ms_positions[:num_tokens_padded]
+
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
             num_scheduled_tokens,
@@ -4711,13 +4859,53 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+                if is_multistep:
+                    outputs = None
+                    for step in range(n_steps):
+                        for attn_group in self.attn_groups:
+                            for group in attn_group:
+                                for builder in group.metadata_builders:
+                                    if builder.ms_slot_buf is not None:
+                                        builder.ms_slot_buf[:num_tokens_padded].copy_(
+                                            builder.ms_slot_2d[:num_tokens_padded, step],
+                                            non_blocking=True,
+                                        )
+                                    decode_wrappers = getattr(
+                                        builder, "_decode_wrappers_cudagraph", None
+                                    )
+                                    if decode_wrappers is not None:
+                                        wrapper = decode_wrappers.get(num_tokens_padded)
+                                        if wrapper is not None:
+                                            wrapper._paged_kv_last_page_len_buf.add_(1)
+
+                        outputs = self.model(
+                            input_ids=cur_ids,
+                            positions=cur_pos,
+                            intermediate_tensors=intermediate_tensors,
+                            inputs_embeds=inputs_embeds,
+                            **model_kwargs,
+                        )
+
+                        if self.use_aux_hidden_state_outputs:
+                            hidden_states, _ = outputs
+                        else:
+                            hidden_states = outputs
+
+                        logits = self.model.compute_logits(
+                            hidden_states[self.ms_logit_idx[:num_tokens_padded]]
+                        )
+                        next_tokens = torch.argmax(logits, dim=-1)
+                        self.ms_output[:num_tokens_padded, step].copy_(next_tokens)
+                        cur_ids[:num_tokens_padded].copy_(next_tokens)
+                        cur_pos[:num_tokens_padded].add_(1)
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
@@ -5898,6 +6086,23 @@ class GPUModelRunner(
 
         # create metadata builders
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+        if envs.VLLM_MULTI_STEP_DECODE_N > 1:
+            max_capture_tokens = (
+                max(self.compilation_config.cudagraph_capture_sizes)
+                if self.compilation_config.cudagraph_capture_sizes
+                else self.max_num_tokens
+            )
+            for attn_group in self.attn_groups:
+                for group in attn_group:
+                    for builder in group.metadata_builders:
+                        builder.ms_slot_buf = self._make_buffer(
+                            max_capture_tokens, dtype=torch.int64
+                        )
+                        builder.ms_slot_2d = self._make_buffer(
+                            max_capture_tokens,
+                            envs.VLLM_MULTI_STEP_DECODE_N,
+                            dtype=torch.int64,
+                        )
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)

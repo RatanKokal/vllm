@@ -228,6 +228,20 @@ class Scheduler(SchedulerInterface):
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        self.num_steps: int = envs.VLLM_MULTI_STEP_DECODE_N
+        valid_num_steps = (1, 2, 4, 8)
+        if self.num_steps not in valid_num_steps:
+            raise ValueError(
+                f"VLLM_MULTI_STEP_DECODE_N={self.num_steps} is not supported."
+            )
+        if self.num_steps > 1:
+            if self.scheduler_config.max_model_len % self.num_steps != 0:
+                raise ValueError(
+                    f"max_model_len ({self.scheduler_config.max_model_len}) "
+                    f"must be divisible by VLLM_MULTI_STEP_DECODE_N ({self.num_steps})."
+                )
+            logger.info("Multi-step decode enabled: num_steps=%d", self.num_steps)
+
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
             kv_cache_config=kv_cache_config,
@@ -441,13 +455,13 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    # For pure decode steps pre-allocate (num_scheduler_steps-1)
+                    # For pure decode steps pre-allocate (num_steps - 1)
                     # extra KV slots so the GPU can run N steps back-to-back.
                     # For prefill (num_new_tokens > 1) keep existing behaviour.
                     _ms_extra_lookahead = (
-                        (self.num_scheduler_steps - 1)
+                        (self.num_steps - 1)
                         if num_new_tokens == 1
-                        and self.num_scheduler_steps > 1
+                        and self.num_steps > 1
                         and not request.resumable
                         else 0
                     )
@@ -901,6 +915,7 @@ class Scheduler(SchedulerInterface):
             # the previous and the current steps.
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
+            num_steps=self.num_steps,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:

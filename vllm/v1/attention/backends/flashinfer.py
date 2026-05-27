@@ -481,6 +481,9 @@ class FlashInferMetadata:
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
 
+    ms_slot_buf: torch.Tensor | None = None
+    ms_slot_2d: torch.Tensor | None = None
+
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     reorder_batch_threshold: int = 1
@@ -501,6 +504,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        self.ms_slot_buf: torch.Tensor | None = None
+        self.ms_slot_2d: torch.Tensor | None = None
 
         if vllm_is_batch_invariant():
             self.decode_fixed_split_size = 2048
@@ -873,6 +878,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             prefill=None,
             decode=None,
             cascade_wrapper=None,
+            ms_slot_buf=self.ms_slot_buf,
+            ms_slot_2d=self.ms_slot_2d,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed
@@ -1304,7 +1311,11 @@ class FlashInferImpl(AttentionImpl):
                 value,
                 kv_cache[:, 0],
                 kv_cache[:, 1],
-                attn_metadata.slot_mapping,
+                (
+                    attn_metadata.ms_slot_buf[:num_actual_tokens]
+                    if attn_metadata.ms_slot_buf is not None
+                    else attn_metadata.slot_mapping
+                ),
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,

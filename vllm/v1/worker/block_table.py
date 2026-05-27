@@ -197,6 +197,26 @@ class BlockTable:
                 out=self.slot_mapping.np[: req_indices.shape[0]],
             )
 
+    def get_multistep_slot_mapping_np(
+        self,
+        num_reqs: int,
+        num_computed_tokens: np.ndarray,
+        num_steps: int,
+    ) -> np.ndarray:
+        block_size = self.block_size
+        result = np.empty((num_reqs, num_steps), dtype=np.int64)
+        block_table_np = self.block_table.np
+        row_indices = np.arange(num_reqs, dtype=np.int64)
+
+        for step in range(num_steps):
+            logical_idx = num_computed_tokens[:num_reqs].astype(np.int64) + step
+            block_idx = logical_idx // block_size
+            slot_offset = logical_idx % block_size
+            phys_block = block_table_np[row_indices, block_idx]
+            result[:, step] = phys_block.astype(np.int64) * block_size + slot_offset
+
+        return result
+
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
 

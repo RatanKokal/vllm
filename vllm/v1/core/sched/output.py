@@ -238,6 +238,9 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Number of decode steps scheduled
+    num_steps: int = 1
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

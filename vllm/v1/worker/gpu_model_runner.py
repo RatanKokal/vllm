@@ -582,6 +582,18 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int64
         )
 
+        # Pre-allocate N-step buffers if N > 1
+        self.num_steps = envs.VLLM_MULTI_STEP_DECODE_N
+        self.ms_input_ids: torch.Tensor | None = None
+        self.ms_positions: torch.Tensor | None = None
+        self.ms_output: torch.Tensor | None = None
+        self.ms_logit_idx: torch.Tensor | None = None
+        if self.num_steps > 1:
+            self.ms_input_ids = torch.zeros(self.max_num_tokens, dtype=torch.int32, device=self.device)
+            self.ms_positions = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=self.device)
+            self.ms_output = torch.zeros((self.max_num_reqs, self.num_steps), dtype=torch.int64, device=self.device)
+            self.ms_logit_idx = torch.arange(self.max_num_tokens, dtype=torch.int64, device=self.device)
+
         # Only relevant for multimodal models
         if self.supports_mm_inputs:
             # Double buffer to avoid race condition: previous iteration's async
@@ -3409,6 +3421,41 @@ class GPUModelRunner(
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+            is_multistep_eligible = (
+                scheduler_output.num_steps > 1
+                and batch_desc.uniform
+                and not use_spec_decode
+                and cudagraph_mode == CUDAGraphMode.FULL
+            )
+
+            if is_multistep_eligible:
+                # Compute [num_reqs, N] slot mapping using the CPU block table
+                req_indices = np.arange(num_reqs)
+                slot_2d_np = (
+                    self.input_batch.block_table[0].get_multistep_slot_mapping_np(
+                        req_indices,
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                        scheduler_output.num_steps,
+                    )
+                )
+
+                builders = [
+                    builder
+                    for kv_group in self.attn_groups
+                    for group in kv_group
+                    for builder in group.metadata_builders
+                ]
+
+                for builder in builders:
+                    if hasattr(builder, "ms_slot_2d") and builder.ms_slot_2d is not None:
+                        builder.ms_slot_2d[:num_reqs].copy_(
+                            torch.from_numpy(slot_2d_np), non_blocking=True
+                        )
+
+                # Adjust seq_lens internally so FlashInfer allocates enough indices lookahead
+                self.seq_lens.np[:num_reqs] += (scheduler_output.num_steps - 1)
+                self.seq_lens.copy_to_gpu()
+
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.preprocess_mamba(
                     scheduler_output,
@@ -3613,18 +3660,28 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
-        # Apply structured output bitmasks if present.
-        if grammar_output is not None:
-            apply_grammar_bitmask(
-                scheduler_output, grammar_output, self.input_batch, logits
+        if getattr(self, "num_steps", 1) > 1 and self.ms_output is not None:
+            num_reqs = len(self.input_batch.req_ids)
+            sampler_output = SamplerOutput(
+                sampled_token_ids=self.ms_output[:num_reqs],
+                logprobs_tensors=None,
             )
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] += (
+                self.num_steps - 1
+            )
+        else:
+            # Apply structured output bitmasks if present.
+            if grammar_output is not None:
+                apply_grammar_bitmask(
+                    scheduler_output, grammar_output, self.input_batch, logits
+                )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            with record_function_or_nullcontext("gpu_model_runner: sample"):
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
-        self._update_states_after_model_execute(
-            sampler_output.sampled_token_ids, scheduler_output
-        )
+            self._update_states_after_model_execute(
+                sampler_output.sampled_token_ids, scheduler_output
+            )
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None
@@ -4691,13 +4748,52 @@ class GPUModelRunner(
                     slot_mapping=slot_mappings,
                 ),
             ):
-                outputs = self.model(
-                    input_ids=input_ids,
-                    positions=positions,
-                    intermediate_tensors=intermediate_tensors,
-                    inputs_embeds=inputs_embeds,
-                    **model_kwargs,
-                )
+                if is_graph_capturing and self.num_steps > 1 and uniform_decode:
+                    # N-Step Multi-Decode Unroll inside the graph
+                    cur_ids = self.ms_input_ids[:num_reqs_padded]
+                    cur_pos = self.ms_positions[:num_reqs_padded]
+
+                    builders = [
+                        builder
+                        for kv_group in self.attn_groups
+                        for group in kv_group
+                        for builder in group.metadata_builders
+                    ]
+
+                    for step in range(self.num_steps):
+                        # D2D swap of slots
+                        for builder in builders:
+                            if hasattr(builder, "ms_slot_buf") and builder.ms_slot_buf is not None:
+                                builder.ms_slot_buf[:num_reqs_padded].copy_(
+                                    builder.ms_slot_2d[:num_reqs_padded, step]
+                                )
+
+                        # In-graph FlashInfer Indptr/Page increments
+                        for builder in builders:
+                            if hasattr(builder, "paged_kv_last_page_len"):
+                                lpl = builder.paged_kv_last_page_len.gpu[:num_reqs_padded]
+                                indptr = builder.paged_kv_indptr.gpu[:num_reqs_padded + 1]
+                                lpl.add_(1)
+                                overflow = (lpl >= self.cache_config.block_size).to(torch.int32)
+                                lpl.sub_(overflow * self.cache_config.block_size)
+                                indptr[1:].add_(torch.cumsum(overflow, dim=0))
+
+                        hidden_states = self.model(input_ids=cur_ids, positions=cur_pos, **model_kwargs)
+                        logits = self.model.compute_logits(hidden_states[self.ms_logit_idx[:num_reqs_padded]])
+                        next_toks = torch.argmax(logits, dim=-1)
+                        self.ms_output[:num_reqs_padded, step] = next_toks
+
+                        cur_ids.copy_(next_toks)
+                        cur_pos.add_(1)
+                    outputs = hidden_states
+                else:
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        positions=positions,
+                        intermediate_tensors=intermediate_tensors,
+                        inputs_embeds=inputs_embeds,
+                        **model_kwargs,
+                    )
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs

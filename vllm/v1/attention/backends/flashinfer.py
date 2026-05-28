@@ -501,6 +501,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             BatchPrefillWithPagedKVCacheWrapper | BatchDCPPrefillWrapper | None
         ) = None  # Wrapper for prefill/append
         self._decode_wrapper = None  # Wrapper for decode (general shape)
+        
+        self.ms_slot_buf: torch.Tensor | None = None
+        self.ms_slot_2d: torch.Tensor | None = None
 
         if vllm_is_batch_invariant():
             self.decode_fixed_split_size = 2048
@@ -1299,12 +1302,17 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
+            slot_map_to_use = (
+                self.builder.ms_slot_buf[:num_actual_tokens]
+                if getattr(self.builder, "ms_slot_buf", None) is not None
+                else attn_metadata.slot_mapping
+            )
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
                 kv_cache[:, 0],
                 kv_cache[:, 1],
-                attn_metadata.slot_mapping,
+                slot_map_to_use,
                 self.kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,

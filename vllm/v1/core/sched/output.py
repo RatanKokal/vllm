@@ -238,6 +238,10 @@ class SchedulerOutput:
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
+    # Multi-step decode: consecutive decode steps the model runner
+    # should execute.  Set by scheduler after pre-allocating blocks.
+    multi_step_n: int = 1
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

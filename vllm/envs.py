@@ -253,6 +253,8 @@ if TYPE_CHECKING:
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
 
+    VLLM_MULTI_STEP_DECODE_N: int = 1
+
 
 def get_default_cache_root():
     return os.getenv(
@@ -1623,6 +1625,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
     "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+    # Multi-step decoding: number of consecutive decode steps to run on
+    # the GPU without returning to the host scheduler loop.
+    # Default 1 (disabled).  Only applies to uniform pure-decode batches.
+    # Incompatible with speculative decoding and pipeline parallelism.
+    "VLLM_MULTI_STEP_DECODE_N": lambda: int(
+        os.getenv("VLLM_MULTI_STEP_DECODE_N", "1")
+    ),
 }
 
 

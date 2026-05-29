@@ -91,6 +91,7 @@ class Scheduler(SchedulerInterface):
         import os
         self._min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
         self._min_queued_timeout_s = float(os.environ.get("VLLM_MIN_QUEUED_TIMEOUT", "0.2"))
+        self.multi_step_n = envs.VLLM_MULTI_STEP_DECODE_N
 
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
@@ -890,6 +891,24 @@ class Scheduler(SchedulerInterface):
             )
             scheduler_output.kv_connector_metadata = meta
 
+        # ── Multi-step block pre-allocation ──
+        # Before the GPU executes N steps, ensure N-1 extra blocks are
+        # reserved per request so GPU-side slot advancement can safely
+        # cross block boundaries.
+        if (
+            self.multi_step_n > 1
+            and scheduler_output.total_num_scheduled_tokens > 0
+            and self._is_pure_decode_batch(scheduler_output)
+        ):
+            success = self._pre_allocate_multi_step_blocks(
+                scheduler_output,
+                n_extra_steps=self.multi_step_n - 1,
+            )
+            scheduler_output.multi_step_n = (
+                self.multi_step_n if success else 1
+            )
+
+
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
             ec_meta: ECConnectorMetadata = self.ec_connector.build_connector_meta(
@@ -900,6 +919,74 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+    
+    def _is_pure_decode_batch(
+        self, scheduler_output: SchedulerOutput
+    ) -> bool:
+        """True iff every request schedules exactly 1 token with no
+        new/resumed requests, no spec decode, no encoder inputs."""
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_cached_reqs.resumed_req_ids:
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        if scheduler_output.scheduled_encoder_inputs:
+            return False
+        return all(
+            n == 1 for n in scheduler_output.num_scheduled_tokens.values()
+        )
+
+    def _pre_allocate_multi_step_blocks(
+        self,
+        scheduler_output: SchedulerOutput,
+        n_extra_steps: int,
+    ) -> bool:
+        """Reserve KV cache blocks for N-1 additional decode tokens.
+
+        Uses num_lookahead_tokens so allocate_slots handles block math
+        without mutating request.num_computed_tokens.
+
+        Returns True if allocation succeeded for every request.
+        """
+        if n_extra_steps <= 0:
+            return True
+
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests.get(req_id)
+            if request is None:
+                continue
+
+            remaining = (
+                self.max_model_len - 1 - request.num_computed_tokens
+            )
+            if remaining < n_extra_steps:
+                return False
+
+            if (
+                request.sampling_params
+                and request.sampling_params.max_tokens is not None
+            ):
+                out_remaining = (
+                    request.sampling_params.max_tokens
+                    - request.num_output_tokens
+                )
+                if out_remaining < n_extra_steps + 1:
+                    return False
+
+            new_blocks = self.kv_cache_manager.allocate_slots(
+                request,
+                num_tokens=1,
+                num_lookahead_tokens=n_extra_steps,
+            )
+            if new_blocks is None:
+                logger.warning(
+                    "Multi-step pre-alloc failed for request %s; "
+                    "falling back to single-step.", req_id,
+                )
+                return False
+
+        return True
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
@@ -1257,6 +1344,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        multi_step_n = model_runner_output.multi_step_n
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1306,6 +1394,69 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+
+            # ── Multi-step decode output handling ──
+            # When multi_step_n > 1, generated_token_ids contains N tokens
+            # from the GPU-side inner loop.
+            #
+            # num_computed_tokens accounting:
+            #   _update_after_schedule advanced by 1 (scheduled token).
+            #   _pre_allocate used num_lookahead_tokens — no mutation.
+            #   GPU advanced positions by N-1 more.
+            #   We advance num_computed_tokens by N-1 here to match.
+            if (
+                multi_step_n > 1
+                and generated_token_ids
+                and not scheduled_spec_token_ids
+            ):
+                request.num_computed_tokens += (multi_step_n - 1)
+
+                stopped = False
+                new_token_ids_out: list[int] = []
+                kv_transfer_params = None
+
+                for tok in generated_token_ids:
+                    request.append_output_token_ids(tok)
+                    new_token_ids_out.append(tok)
+                    stopped = check_stop(request, self.max_model_len)
+                    if stopped:
+                        break
+
+                new_logprobs = None
+                if (
+                    request.sampling_params is not None
+                    and request.sampling_params.logprobs is not None
+                    and logprobs
+                ):
+                    new_logprobs = logprobs.slice_request(
+                        req_index, len(new_token_ids_out)
+                    )
+
+                finish_reason = None
+                if stopped:
+                    finish_reason = request.get_finished_reason()
+                    finished = self._handle_stopped_request(request)
+                    if finished:
+                        kv_transfer_params = self._free_request(request)
+                    stopped_running_reqs.add(request)
+
+                outputs[request.client_index].append(
+                    EngineCoreOutput(
+                        request_id=req_id,
+                        new_token_ids=new_token_ids_out,
+                        finish_reason=finish_reason,
+                        new_logprobs=new_logprobs,
+                        stop_reason=request.stop_reason,
+                        events=request.take_events(),
+                        kv_transfer_params=kv_transfer_params,
+                        trace_headers=request.trace_headers,
+                        num_cached_tokens=request.num_cached_tokens,
+                    )
+                )
+                continue
+
+            # ── Normal single-step path (unchanged below) ──
+
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1

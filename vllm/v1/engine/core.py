@@ -378,15 +378,23 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        future = self.model_executor.execute_model(
+            scheduler_output, non_block=True
+        )
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
             model_output = future.result()
             if model_output is None:
+                # Normal path: model forward done, sample separately.
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    scheduler_output
+                )
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            # else: multi-step path returned ModelRunnerOutput directly,
+            # or PP non-last rank returned IntermediateTensors.
+            # Both fall through correctly.
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

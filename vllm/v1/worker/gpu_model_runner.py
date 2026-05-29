@@ -640,6 +640,24 @@ class GPUModelRunner(
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
+        # ── Multi-step decode ──
+        self.multi_step_n: int = envs.VLLM_MULTI_STEP_DECODE_N
+        if self.multi_step_n > 1:
+            if self.num_spec_tokens > 0:
+                logger.warning(
+                    "Multi-step decode incompatible with speculative "
+                    "decoding. Disabling (N=%d).", self.multi_step_n)
+                self.multi_step_n = 1
+            elif self.parallel_config.pipeline_parallel_size > 1:
+                logger.warning(
+                    "Multi-step decode incompatible with pipeline "
+                    "parallelism. Disabling (N=%d).", self.multi_step_n)
+                self.multi_step_n = 1
+            else:
+                logger.info("Multi-step decode enabled with N=%d",
+                            self.multi_step_n)
+
+
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
@@ -701,6 +719,18 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
+
+        # ── Multi-step static GPU buffers ──
+        if self.multi_step_n > 1:
+            N = self.multi_step_n
+            self._ms_token_buf_gpu = torch.zeros(
+                self.max_num_reqs, N, dtype=torch.int64,
+                device=self.device,
+            )
+            self._ms_token_buf_cpu = torch.zeros(
+                self.max_num_reqs, N, dtype=torch.int64,
+                device="cpu", pin_memory=self.pin_memory,
+            )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3267,6 +3297,233 @@ class GPUModelRunner(
 
         return slot_mappings_by_gid, slot_mappings_by_layer
 
+    # ══════════════════════════════════════════════════════════════
+    #  Multi-Step Decode — GPU-only asynchronous stream unroll
+    # ══════════════════════════════════════════════════════════════
+
+    def _is_multi_step_eligible(
+        self,
+        scheduler_output: "SchedulerOutput",
+       num_reqs: int,
+        total_tokens: int,
+        max_num_scheduled: int,
+    ) -> bool:
+        """True iff batch qualifies for N-step GPU-side decode."""
+        if max_num_scheduled != 1 or total_tokens != num_reqs:
+            return False
+        if scheduler_output.scheduled_new_reqs:
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        if scheduler_output.scheduled_encoder_inputs:
+            return False
+        if self.supports_mm_inputs:
+            return False
+        if self.model_config.is_encoder_decoder:
+            return False
+        if self.uses_mrope or self.uses_xdrope_dim > 0:
+            return False
+        return True
+
+    @torch.inference_mode()
+    def _execute_multi_step_decode(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        logits_indices: torch.Tensor,
+        attn_metadata: "PerLayerAttnMetadata",
+        slot_mappings: (
+            "dict[str, torch.Tensor]"
+            " | list[dict[str, torch.Tensor]]"
+            " | None"
+        ),
+        slot_mappings_by_group: "dict[int, torch.Tensor] | None",
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: "BatchDescriptor",
+        num_tokens_padded: int,
+    ) -> ModelRunnerOutput:
+        """Run N decode steps as one asynchronous CUDA stream burst.
+
+        The CPU dispatches all N steps' GPU kernels in a tight Python
+        loop (microseconds of CPU wall time per iteration), then waits
+        at a single torch.cuda.synchronize() at the very end.
+
+        Between steps, only GPU tensor ops are used for state mutation:
+          - copy_ (sampled token → input_ids)
+          - add_  (positions += 1, seq_lens += 1)
+          - in-place slot_mapping arithmetic
+
+        CPU shadows (.np arrays) are advanced purely on the CPU side
+        for _build_attention_metadata's numpy consumers.  No H2D copy
+        of these shadows is performed — the GPU tensors are already
+        correct from their add_ ops.
+
+        IMPORTANT: CpuGpuBuffer.np and .cpu share the same underlying
+        memory.  Only .np is advanced to avoid double-counting.
+       """
+        N = self.multi_step_n
+        token_buf = self._ms_token_buf_gpu[:num_reqs, :N]
+
+        # Block sizes per KV cache group for slot advancement.
+        group_block_sizes: dict[int, int] = {}
+        if slot_mappings_by_group:
+            for gid in slot_mappings_by_group:
+                group_block_sizes[gid] = (
+                    self.kv_cache_config.kv_cache_groups[gid]
+                    .kv_cache_spec.block_size
+                )
+
+        num_reqs_padded = (
+            batch_desc.num_reqs
+            if batch_desc.num_reqs is not None
+            else num_reqs
+        )
+        pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+        for step in range(N):
+            if step > 0:
+                # ── Advance static GPU buffers (zero CPU-GPU sync) ──
+
+                # 1) input_ids ← previous step's sampled tokens
+                self.input_ids.gpu[:num_reqs].copy_(
+                    token_buf[:, step - 1].to(torch.int32)
+                )
+
+                # 2) positions += 1 (GPU async)
+                self.positions.gpu[:num_reqs].add_(1)
+
+                # 3) seq_lens += 1 (GPU async — NO copy_to_gpu)
+                self.seq_lens.gpu[:num_reqs].add_(1)
+
+                # 4) Advance slot_mappings in-place (all GPU ops).
+                for gid, sm_tensor in (
+                    slot_mappings_by_group or {}
+                ).items():
+                    bs = group_block_sizes[gid]
+                    slots = sm_tensor[:num_reqs]
+                    offsets = slots % bs
+                    crossing = offsets == (bs - 1)
+
+                    if not crossing.any():
+                        slots.add_(1)
+                    else:
+                        slots[~crossing] += 1
+                        # Block-crossing: read next block from table.
+                        bt_gpu = (
+                            self.input_batch.block_table[gid]
+                            .get_device_tensor(num_reqs_padded)
+                        )
+                        new_pos = (
+                            self.positions.gpu[:num_reqs][crossing]
+                        )
+                        new_blk_idx = (
+                            (new_pos // bs).to(torch.int32)
+                        )
+                        cx_idx = crossing.nonzero(
+                            as_tuple=True
+                        )[0]
+                        new_blk_nums = bt_gpu[
+                            cx_idx, new_blk_idx
+                        ]
+                        slots[crossing] = (
+                            new_blk_nums.to(torch.int64) * bs
+                        )
+
+                # 5) Advance CPU shadows for _build_attention_metadata.
+                #    .np and .cpu share memory — advance ONLY .np.
+                self.seq_lens.np[:num_reqs] += 1
+                self.positions.np[:num_reqs] += 1
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] += 1
+
+                # 6) Rebuild attention metadata.
+                #    PERF: flashinfer.plan() does internal H2D copies
+                #    (~1ms CPU overhead/step).  Future optimization:
+                #    advance indptr/last_page_len GPU-side directly.
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_reqs,
+                    num_tokens_padded=(
+                        num_tokens_padded if pad_attn else None
+                    ),
+                    num_reqs=num_reqs,
+                    num_reqs_padded=(
+                        num_reqs_padded if pad_attn else None
+                    ),
+                    max_query_len=1,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=(
+                        scheduler_output.num_scheduled_tokens
+                    ),
+                    slot_mappings=slot_mappings_by_group,
+                )
+            # ── Model forward ──
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=None,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=None,
+                slot_mapping=slot_mappings,
+            ):
+                hidden_states = self._model_forward(
+                    input_ids=self.input_ids.gpu[:num_tokens_padded],
+                    positions=self.positions.gpu[:num_tokens_padded],
+                    intermediate_tensors=None,
+                    inputs_embeds=None,
+                )
+
+            if self.use_aux_hidden_state_outputs:
+                hidden_states, _ = hidden_states
+
+            # ── Sample ──
+            sample_hidden = hidden_states[logits_indices]
+            logits = self.model.compute_logits(sample_hidden)
+            sampler_output = self.sampler(
+                logits=logits,
+                sampling_metadata=self.input_batch.sampling_metadata,
+            )
+            # sampler_output.sampled_token_ids: [num_reqs, 1]
+            token_buf[:, step] = (
+                sampler_output.sampled_token_ids[:num_reqs, 0]
+            )
+
+        # ── Single consolidated sync ──
+        self._ms_token_buf_cpu[:num_reqs, :N].copy_(
+            token_buf, non_blocking=True
+        )
+        torch.cuda.synchronize()
+
+        sampled_lists = self._ms_token_buf_cpu[:num_reqs, :N].tolist()
+
+        # ── Update model runner cached state ──
+        req_ids = self.input_batch.req_ids[:num_reqs]
+        for req_idx, req_id in enumerate(req_ids):
+            rs = self.requests.get(req_id)
+            if rs is None:
+                continue
+            tokens = sampled_lists[req_idx]
+            rs.output_token_ids.extend(tokens)
+            start = self.input_batch.num_tokens_no_spec[req_idx]
+            end = start + N
+            self.input_batch.token_ids_cpu[req_idx, start:end] = tokens
+            self.input_batch.num_tokens_no_spec[req_idx] = end
+
+        # CPU shadows were advanced inside the loop for steps 1..N-1.
+        # Step 0's advancement is handled by scheduler's
+        # _update_after_schedule.  No further fixup needed.
+
+        return ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids[:num_reqs].copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            sampled_token_ids=sampled_lists,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            multi_step_n=N,
+        )
+
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -3461,6 +3718,39 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+
+            # ── Multi-step decode fast-path ──
+            # Injection point: all preprocessing is complete.  Every needed
+            # variable is live: logits_indices, attn_metadata, slot_mappings,
+            # slot_mappings_by_group, cudagraph_mode, batch_desc,
+            # num_tokens_padded, num_reqs, num_tokens_unpadded,
+            # max_num_scheduled_tokens.
+            if (
+                self.multi_step_n > 1
+                and get_pp_group().is_last_rank
+                and not self.broadcast_pp_output
+                and not self.is_pooling_model
+                and getattr(scheduler_output, 'multi_step_n', 1) > 1
+                and self._is_multi_step_eligible(
+                    scheduler_output,
+                    num_reqs,
+                num_tokens_unpadded,
+                    max_num_scheduled_tokens,
+                )
+            ):
+                ms_output = self._execute_multi_step_decode(
+                    scheduler_output=scheduler_output,
+                    num_reqs=num_reqs,
+                    logits_indices=logits_indices,
+                    attn_metadata=attn_metadata,
+                    slot_mappings=slot_mappings,
+                    slot_mappings_by_group=slot_mappings_by_group,
+                    cudagraph_mode=cudagraph_mode,
+                    batch_desc=batch_desc,
+                    num_tokens_padded=num_tokens_padded,
+                )
+                self.kv_connector_output = kv_connector_output
+                return ms_output
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible

@@ -187,6 +187,9 @@ class ModelRunnerOutput:
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 
+    # Multi-step decode: how many tokens each sampled_token_ids[i]
+    # contains.  Default 1 (normal single-step).
+    multi_step_n: int = 1
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

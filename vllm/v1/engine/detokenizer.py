@@ -3,9 +3,9 @@
 from abc import ABC, abstractmethod
 
 import tokenizers
+import tokenizers.decoders as tokenizers_decoders
 from packaging import version
 from tokenizers import Tokenizer
-from tokenizers.decoders import DecodeStream
 from transformers import PreTrainedTokenizerFast
 
 from vllm.logger import init_logger
@@ -175,7 +175,9 @@ class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
 
         self.request_id = request.request_id
         self.skip_special_tokens = sampling_params.skip_special_tokens
-        self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
+        self.stream = tokenizers_decoders.DecodeStream(
+            skip_special_tokens=self.skip_special_tokens
+        )
 
         self.tokenizer: Tokenizer = tokenizer._tokenizer
 

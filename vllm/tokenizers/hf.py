@@ -7,6 +7,7 @@ from typing import TypeAlias
 
 from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
+import vllm.envs as envs
 from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_config
 
 from .protocol import TokenizerLike
@@ -75,6 +76,12 @@ class CachedHfTokenizer(TokenizerLike):
         download_dir: str | None = None,
         **kwargs,
     ) -> HfTokenizer:
+        if envs.VLLM_USE_FASTOKENS:
+            from .fastokens import apply_fastokens_patch
+
+            apply_fastokens_patch()
+            kwargs.setdefault("use_fast", True)
+
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 path_or_repo_id,

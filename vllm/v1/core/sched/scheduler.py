@@ -92,6 +92,10 @@ class Scheduler(SchedulerInterface):
         self._min_queued_reqs = int(os.environ.get("VLLM_MIN_QUEUED_REQS", "0"))
         self._min_queued_timeout_s = float(os.environ.get("VLLM_MIN_QUEUED_TIMEOUT", "0.2"))
 
+        # ---- N-STEP DECODE (added) ----
+        # Must match GPUModelRunner.n_step_size (read from same env var).
+        self.n_step_size = int(os.environ.get("VLLM_N_STEP_SIZE", "1"))
+
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -712,6 +716,18 @@ class Scheduler(SchedulerInterface):
                 effective_lookahead_tokens = (
                     0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
                 )
+                # N-step decode: at prefill admission, reserve the entire output
+                # runway so that the autonomous n-step decode loop never needs a
+                # new block allocation between schedule() calls.
+                if (
+                    self.n_step_size > 1
+                    and request.num_computed_tokens == 0
+                    and not load_kv_async
+                ):
+                    runway = request.max_tokens
+                    effective_lookahead_tokens = max(
+                        effective_lookahead_tokens, runway
+                    )
 
                 num_encoder_tokens = (
                     self._num_encoder_max_input_tokens
@@ -1341,6 +1357,22 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                # N-step decode correction:
+                # The scheduler advanced num_computed_tokens by num_tokens_scheduled
+                # (== 1 for decode) in _update_after_schedule, but the model runner
+                # generated len(new_token_ids) tokens this step (n-step replay).
+                # Reconcile so num_computed_tokens reflects the KV actually written.
+                # Skipped for the speculative path (handled above via rejection
+                # accounting) and only applied to fully-running, non-stopped reqs.
+                if (
+                    self.n_step_size > 1
+                    and not stopped
+                    and not scheduled_spec_token_ids
+                    and len(new_token_ids) > num_tokens_scheduled
+                ):
+                    request.num_computed_tokens += (
+                        len(new_token_ids) - num_tokens_scheduled
+                    )
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -701,6 +702,16 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
+
+        # ---- N-STEP DECODE (added) ----
+        # Number of decode tokens to generate per single schedule() call by
+        # replaying the captured 1-step FULL cudagraph n times with in-place
+        # metadata updates. Only used for pure greedy decode on FlashInfer.
+        self.n_step_size = int(os.environ.get("VLLM_N_STEP_SIZE", "1"))
+        if self.n_step_size > 1:
+            logger.info_once(
+                "N-step decode enabled with n_step_size=%d", self.n_step_size
+            )
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3477,6 +3488,39 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
+        if self._nstep_eligible(
+            scheduler_output=scheduler_output,
+            num_reqs=num_reqs,
+            num_tokens_unpadded=num_tokens_unpadded,
+            max_num_scheduled_tokens=max_num_scheduled_tokens,
+            cudagraph_mode=cudagraph_mode,
+            has_encoder_input=has_encoder_input,
+            use_spec_decode=use_spec_decode,
+            inputs_embeds=inputs_embeds,
+            spec_decode_metadata=spec_decode_metadata,
+        ):
+            return self._execute_nstep(
+                scheduler_output=scheduler_output,
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs_padded,
+                num_tokens_padded=num_tokens_padded,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                logits_indices=logits_indices,
+                attn_metadata=attn_metadata,
+                slot_mappings_by_group=slot_mappings_by_group,
+                slot_mappings=slot_mappings,
+                cudagraph_mode=cudagraph_mode,
+                batch_desc=batch_desc,
+                num_tokens_across_dp=num_tokens_across_dp,
+                ubatch_slices_padded=ubatch_slices_padded,
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                model_kwargs=model_kwargs,
+                max_num_scheduled_tokens=max_num_scheduled_tokens,
+                pad_attn=pad_attn,
+            )
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -3575,6 +3619,251 @@ class GPUModelRunner(
         )
         self.kv_connector_output = kv_connector_output
         return None
+
+    def _nstep_eligible(
+        self,
+        *,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        num_tokens_unpadded: int,
+        max_num_scheduled_tokens: int,
+        cudagraph_mode: CUDAGraphMode,
+        has_encoder_input: bool,
+        use_spec_decode: bool,
+        inputs_embeds: torch.Tensor | None,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        """Return True iff this batch can use the n-step decode fast path.
+
+        Conservative: any doubt -> return False -> normal single-step path.
+        """
+        if self.n_step_size <= 1:
+            return False
+        if max_num_scheduled_tokens != 1:
+            return False
+        if num_tokens_unpadded != num_reqs:
+            return False
+        if num_reqs <= 0:
+            return False
+        if cudagraph_mode != CUDAGraphMode.FULL:
+            return False
+        if use_spec_decode or spec_decode_metadata is not None:
+            return False
+        if self.num_spec_tokens != 0 or self.speculative_config is not None:
+            return False
+        if self.supports_mm_inputs or self.enable_prompt_embeds:
+            return False
+        if inputs_embeds is not None:
+            return False
+        if has_encoder_input or self.model_config.is_encoder_decoder:
+            return False
+        if self.max_encoder_len > 0:
+            return False
+        if self.is_pooling_model:
+            return False
+        if not get_pp_group().is_last_rank or not get_pp_group().is_first_rank:
+            return False
+        if self.broadcast_pp_output:
+            return False
+        if self.use_async_scheduling:
+            return False
+        if has_kv_transfer_group() or has_ec_transfer():
+            return False
+        if self.model_config.enable_return_routed_experts:
+            return False
+        if self.uses_mrope or self.uses_xdrope_dim > 0:
+            return False
+        if self.dcp_world_size > 1 or self.parallel_config.use_ubatching:
+            return False
+        if scheduler_output.has_structured_output_requests:
+            return False
+        if self.num_prompt_logprobs:
+            return False
+        if len(self.kv_cache_config.kv_cache_groups) != 1:
+            return False
+
+        sm = self.input_batch.sampling_metadata
+        if not sm.all_greedy:
+            return False
+        if not sm.no_penalties:
+            return False
+        if sm.max_num_logprobs is not None:
+            return False
+        if sm.allowed_token_ids_mask is not None:
+            return False
+        if sm.bad_words_token_ids:
+            return False
+
+        if getattr(sm, "logitsprocs", None) is not None:
+            lp = sm.logitsprocs
+            has_any = False
+            for attr in ("argmax_invariant", "non_argmax_invariant"):
+                seq = getattr(lp, attr, None)
+                if seq:
+                    try:
+                        if len(list(seq)) > 0:
+                            has_any = True
+                    except TypeError:
+                        has_any = True
+            if has_any:
+                return False
+
+        if not sm.ignore_eos:
+            return False
+        if getattr(sm, "stop_token_ids", None) or getattr(
+            sm, "stop_strings", None
+        ):
+            return False
+
+        if bool(self.discard_request_mask.np[:num_reqs].any()):
+            return False
+        end_positions = (
+            self.input_batch.num_computed_tokens_cpu[:num_reqs] + self.n_step_size
+        )
+        if int(end_positions.max()) >= self.max_model_len:
+            return False
+        if int(end_positions.max()) >= self.input_batch.token_ids_cpu.shape[1]:
+            return False
+        return True
+
+    @torch.inference_mode()
+    def _execute_nstep(
+        self,
+        *,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens_padded: int,
+        num_scheduled_tokens_np: np.ndarray,
+        logits_indices: torch.Tensor,
+        attn_metadata: PerLayerAttnMetadata,
+        slot_mappings_by_group: dict[int, torch.Tensor] | None,
+        slot_mappings: dict[str, torch.Tensor]
+        | list[dict[str, torch.Tensor]]
+        | None,
+        cudagraph_mode: CUDAGraphMode,
+        batch_desc: "BatchDescriptor",
+        num_tokens_across_dp,
+        ubatch_slices_padded,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        model_kwargs: dict[str, Any],
+        max_num_scheduled_tokens: int,
+        pad_attn: bool,
+    ) -> ModelRunnerOutput:
+        """Generate n decode tokens per request by replaying the captured
+        1-step FULL cudagraph n times, updating attention metadata, positions,
+        seq_lens, slot_mapping and input_ids in place between replays.
+
+        Returns a fully-populated (synchronous) ModelRunnerOutput whose
+        sampled_token_ids is a list[list[int]] of length n per request.
+        """
+        n = self.n_step_size
+        device = self.device
+
+        req_indices = self.arange_np[:num_reqs]
+
+        all_sampled = torch.empty((n, num_reqs), dtype=torch.int64, device=device)
+
+        block_table0 = self.input_batch.block_table[0]
+
+        for step in range(n):
+            if step > 0:
+                self.input_ids.gpu[:num_reqs].copy_(
+                    all_sampled[step - 1].to(torch.int32), non_blocking=True
+                )
+                self.positions.np[:num_reqs] += 1
+                self.positions.gpu[:num_reqs].copy_(
+                    torch.from_numpy(self.positions.np[:num_reqs]),
+                    non_blocking=True,
+                )
+                self.seq_lens.np[:num_reqs] += 1
+                self.seq_lens.np[num_reqs:].fill(0)
+                self.seq_lens.copy_to_gpu()
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] += 1
+
+                block_table0.compute_slot_mapping(
+                    req_indices, self.positions.np[:num_reqs]
+                )
+                block_table0.commit_slot_mapping(num_reqs)
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs_padded=num_reqs_padded,
+                    num_tokens_unpadded=num_reqs,
+                    ubatch_slices=ubatch_slices_padded,
+                )
+
+                attn_metadata, _ = self._build_attention_metadata(
+                    num_tokens=num_reqs,
+                    num_tokens_padded=num_tokens_padded if pad_attn else None,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded if pad_attn else None,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_padded if pad_attn else None,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    cascade_attn_prefix_lens=None,
+                    slot_mappings=slot_mappings_by_group,
+                )
+
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                ubatch_slices=ubatch_slices_padded,
+                slot_mapping=slot_mappings,
+            ):
+                model_output = self._model_forward(
+                    input_ids=self.input_ids.gpu[:num_tokens_padded]
+                    if input_ids is not None
+                    else None,
+                    positions=self.positions.gpu[:num_tokens_padded],
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=None,
+                    **model_kwargs,
+                )
+
+            hidden_states = model_output
+            sample_hidden = hidden_states[logits_indices]
+            logits = self.model.compute_logits(sample_hidden)
+            sampled = logits.argmax(dim=-1).view(-1).to(torch.int64)
+            all_sampled[step].copy_(sampled)
+
+        sampled_host = all_sampled.transpose(0, 1).contiguous().cpu()
+        valid_sampled_token_ids: list[list[int]] = sampled_host.tolist()
+
+        req_ids = self.input_batch.req_ids
+        for req_idx in range(num_reqs):
+            tokens = valid_sampled_token_ids[req_idx]
+            start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+            end_idx = start_idx + len(tokens)
+            assert end_idx <= self.max_model_len
+            self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = tokens
+            self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
+            self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+
+            req_id = req_ids[req_idx]
+            req_state = self.requests[req_id]
+            req_state.output_token_ids.extend(tokens)
+
+        self.eplb_step()
+
+        output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids.copy(),
+            req_id_to_index=self.input_batch.req_id_to_index.copy(),
+            sampled_token_ids=valid_sampled_token_ids,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            kv_connector_output=None,
+            num_nans_in_logits=None,
+            cudagraph_stats=None,
+        )
+        return output
 
     @torch.inference_mode
     def sample_tokens(
